@@ -1,0 +1,66 @@
+.page { min-height: 100%; background: #f5f7fb; color: #183153; padding: 32px; }
+.container { max-width: 1400px; margin: 0 auto; }
+.header { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 28px;
+  h1 { margin: 8px 0 10px; font-size: 28px; font-weight: 650; }
+  p { margin: 0; color: #64748b; line-height: 1.8; }
+}
+.eyebrow { color: #4a73a4; display: flex; align-items: center; gap: 8px; letter-spacing: 1.6px; font-size: 11px; font-weight: 600; }
+.queryCard, .resultCard, .sidebar, .tableCard { background: #fff; border: 1px solid #e3eaf2; border-radius: 14px; box-shadow: 0 3px 14px #18315303; min-width: 0; }
+.queryCard, .resultCard { padding: 24px; margin-bottom: 20px; }
+.cardHeading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px;
+  h2 { font-size: 16px; margin: 0; color: #183153; font-weight: 600; }
+}
+.description { color: #64748b; font-size: 13px; line-height: 1.8; margin: 6px 0 0; overflow-wrap: anywhere; }
+.corpusNote { margin: 12px 0 0; padding: 10px 13px; border-left: 3px solid #9bb9dd; border-radius: 4px; background: #f5f8fd; color: #667e9b; font-size: 12px; line-height: 1.9; }
+.searchForm { display: flex; gap: 12px; margin-top: 18px;
+  > :first-child { min-width: 0; }
+  > button { flex-shrink: 0; }
+}
+.examples { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 15px; font-size: 12px; color: #64748b;
+  button { border: 1px solid #e2eaf5; background: #f8faff; color: #4d6689; font: inherit; border-radius: 6px; padding: 5px 9px; cursor: pointer;
+    &:hover { color: #2563b8; border-color: #aac9ee; }
+    &:disabled { opacity: .5; cursor: default; }
+  }
+}
+.workspace { display: grid; grid-template-columns: 265px minmax(0, 1fr); gap: 20px; align-items: start; }
+.sidebar { padding: 20px 14px; }
+.tableList { display: flex; flex-direction: column; gap: 7px; }
+.tableItem { width: 100%; display: flex; text-align: left; gap: 11px; padding: 14px 10px; border: 1px solid transparent; border-radius: 9px; background: #fff; color: #526780; cursor: pointer; font: inherit;
+  > :first-child { margin-top: 3px; }
+  strong { display: block; color: #294462; font-size: 13px; margin-bottom: 6px; font-weight: 600; }
+  small { display: block; font-size: 11px; line-height: 1.9; }
+  &:hover { background: #f6f9ff; }
+}
+.active { border-color: #c9dcf5; background: #eef5ff; color: #386dae; strong { color: #245caa; } }
+.sidebarNote { margin: 20px 8px 0; padding-top: 16px; border-top: 1px solid #edf1f6; color: #7a8aa0; font-size: 12px; line-height: 1.8; }
+.tableCard { padding: 24px; overflow: hidden; }
+.dataTable { min-width: 0;
+  :global(.ant-table-thead > tr > th) { color: #405d7d; background: #f6f8fc; font-size: 12px; }
+  :global(.ant-table-tbody > tr > td) { color: #334a64; font-size: 13px; }
+  small { display: block; color: #8c9baf; font-size: 10px; font-weight: 400; margin-top: 4px; }
+}
+.loading { min-height: 180px; display: flex; justify-content: center; align-items: center; gap: 12px; color: #64748b; font-size: 13px; }
+.empty { min-height: 300px; display: flex; flex-direction: column; gap: 16px; justify-content: center; align-items: center; }
+.pagination { margin-top: 20px; display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; color: #7a8aa0; font-size: 12px; }
+.explanation { font-size: 14px; line-height: 1.8; color: #526780; }
+.sql { margin: 16px 0; padding: 13px 16px; background: #f7f9fd; border-radius: 8px; color: #466b9a; font-size: 12px;
+  summary { cursor: pointer; }
+  pre { overflow-wrap: anywhere; white-space: pre-wrap; line-height: 1.7; margin-bottom: 0; }
+}
+.resultCount { margin: 16px 0 0; color: #7a8aa0; font-size: 12px; line-height: 1.8; }
+.page button:focus-visible { outline: 2px solid #3b82d0; outline-offset: 3px; }
+@media (max-width: 1100px) {
+  .page { padding: 24px; }
+  .workspace { grid-template-columns: minmax(0, 1fr); }
+  .tableList { flex-direction: row; flex-wrap: wrap; }
+  .tableItem { flex: 1; min-width: 200px; }
+  .sidebarNote { margin-top: 14px; }
+}
+@media (max-width: 640px) {
+  .page { padding: 18px 12px; }
+  .header { align-items: flex-start; gap: 8px; h1 { font-size: 24px; } > :last-child { margin-top: 28px; } }
+  .queryCard, .resultCard, .tableCard { padding: 17px; }
+  .searchForm { flex-direction: column; }
+  .tableItem { min-width: 100%; }
+  .pagination { justify-content: center; }
+}

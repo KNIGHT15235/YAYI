@@ -1,0 +1,194 @@
+
+.newchat-page {
+  padding: 42px 40px;
+  margin: 0 auto;
+  max-width: 1040px;
+  min-width: 0;
+  box-sizing: border-box;
+
+  .newchat-page__header {
+    margin-bottom: 38px;
+    h1 { margin: 8px 0 10px; font-size: 30px; color: #132d52; letter-spacing: -.5px; }
+    p { margin: 0; font-size: 14px; color: #6b7c94; line-height: 1.8; }
+  }
+
+  .newchat-page__sender {
+    margin-top: 14px;
+    border: 1px solid #cfdef5;
+    background: #fff;
+    box-shadow: 0 10px 32px rgba(33, 75, 130, .05);
+    :global(.ant-input) { min-height: 130px; font-size: 15px; padding: 22px; }
+    :global(.com-sender__actions) { padding: 0 20px 18px; gap: 12px; flex-wrap: wrap; }
+    :global(.com-sender__actions-left) { flex-wrap: wrap; }
+  }
+
+  // 推荐问题区域 - 标题和问题在同一行
+  .newchat-page__questions-row {
+    margin-top: 28px;
+    display: flex;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 16px;
+
+    .questions-label {
+      font-size: 14px;
+      color: #425571;
+      flex-shrink: 0;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      span { font-size: 12px; color: #8593a7; }
+    }
+
+    .questions-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .question-tag {
+      text-align: left;
+      font-size: 13px;
+      line-height: 1.8;
+      color: #526682;
+      background: #fff;
+      border: 1px solid #e5ebf5;
+      border-radius: 10px;
+      padding: 12px 16px;
+      cursor: pointer;
+      transition: color 0.2s;
+
+      &:hover {
+        color: #2466d7;
+        border-color: #a6c4f8;
+      }
+
+      &::before {
+        content: '↗';
+        color: #5888d4;
+        margin-right: 10px;
+      }
+    }
+  }
+
+  // 热门资讯区域
+  .newchat-page__section {
+    margin-top: 24px;
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 12px;
+
+      .section-icon {
+        width: 20px;
+        height: 20px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+
+        > img {
+          width: 16px;
+          height: 16px;
+          opacity: 0.6;
+        }
+      }
+
+      .section-title {
+        font-size: 13px;
+        font-weight: 500;
+        color: #8c8c8c;
+      }
+    }
+  }
+
+  // 热门资讯列表 - 和招标信息页面一致
+  .newchat-page__news-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .newchat-page__news-card {
+    padding: 16px;
+    background: #fff;
+    border-radius: 8px;
+    border: 1px solid #f0f0f0;
+    cursor: pointer;
+    transition: all 0.2s;
+
+    &:hover {
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+      border-color: #d9d9d9;
+    }
+
+    .news-card__title {
+      font-size: 16px;
+      font-weight: 500;
+      color: #262626;
+      margin-bottom: 10px;
+      line-height: 1.5;
+    }
+
+    .news-card__info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+
+      .info-location {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 13px;
+        color: #595959;
+      }
+    }
+
+    .news-card__meta {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+
+      .meta-item {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 13px;
+        color: #8c8c8c;
+      }
+    }
+  }
+}
+
+.eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 2px; color: #6d87af; }
+.mode-panel {
+  margin: -10px 0 28px;
+  > p { margin: 10px 0 0; font-size: 12px; color: #8391a6; line-height: 1.8; }
+}
+.mode-options {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;
+  button { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; min-width: 0; padding: 17px 20px; border: 1px solid #dfe7f2; border-radius: 12px; background: #fff; cursor: pointer; text-align: left; transition: border-color .15s, background .15s;
+    strong { color: #344d70; font-size: 15px; } span { font-size: 12px; color: #7f8fa5; line-height: 1.6; }
+    &[aria-pressed='true'] { background: #edf4ff; border-color: #7fa9eb; box-shadow: 0 0 0 1px #7fa9eb inset; strong { color: #2466c8; } }
+    &:focus-visible { outline: 2px solid #2466c8; outline-offset: 3px; }
+  }
+}
+.industry-topic { margin-top: 14px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px; font-size: 13px; color: #526682; :global(.ant-select) { min-width: 150px; } small { color: #8593a7; } }
+.input-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; color: #203b62; span { font-size: 12px; color: #8593a7; } }
+.workflow {
+  margin-top: 34px; padding: 24px; border: 1px solid #e2e9f3; border-radius: 14px; background: #edf3fc;
+  > div { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; strong { color: #23406a; } span { font-size: 12px; color: #7287a5; } }
+  ol { list-style: none; margin: 24px 0; padding: 0; display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; }
+  li { display: flex; flex-direction: column; gap: 10px; font-size: 12px; color: #445f83; b { color: #3270ce; font-size: 16px; font-weight: 500; } }
+  p { margin: 0; padding-top: 16px; border-top: 1px solid #d9e3f2; color: #7b8da7; font-size: 12px; line-height: 1.9; }
+}
+@media (max-width: 700px) {
+  .mode-options { gap: 8px; button { padding: 14px 12px; strong { font-size: 14px; } span { font-size: 11px; } } }
+  .newchat-page { padding: 26px 18px; .newchat-page__header h1 { font-size: 26px; } }
+  .workflow { padding: 18px; ol { grid-template-columns: repeat(3, 1fr); row-gap: 24px; } }
+}
