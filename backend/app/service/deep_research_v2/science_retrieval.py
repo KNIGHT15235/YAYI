@@ -10,15 +10,17 @@ import json
 import re
 import time
 
-from .evidence import ensure_science_state, merge_scientific_papers
+from .evidence import ensure_science_state, merge_scientific_papers, canonical_source
 from .literature_sources import (RetrievalBudget, RetrievalBudgetExhausted,
                                  collect_literature, query_scope)
 
 
 DEFAULT_LIMITS = {"enabled": True, "max_depth": 2, "max_branches": 2,
-                  "max_queries": 8, "max_requests": 48, "max_documents": 2400, "max_papers": 200,
+                  "max_queries": 8, "max_initial_queries": 8, "max_requests": 48, "max_documents": 2400, "max_papers": 200,
                   "max_seconds": 600, "query_timeout_seconds": 90,
-                  "proposal_timeout_seconds": 45}
+                  "proposal_timeout_seconds": 45, "max_batch_queries": 3,
+                  "max_batch_requests": 8, "max_batch_documents": 600, "max_batch_seconds": 180,
+                  "max_batch_papers": 60}
 
 
 def retrieval_limits(state):
@@ -47,9 +49,16 @@ def ensure_retrieval_state(state):
     ensure_science_state(state)
     data = state.setdefault("science_retrieval", {})
     first = not data
-    data.setdefault("schema_version", 1)
     data.setdefault("original_query", state["query"])
     data.setdefault("scope", query_scope(data["original_query"]))
+    if data.get("schema_version", 1) < 2:
+        # Old snapshots inferred optical-only scope from any remote-sensing
+        # question. Correct modality policy from the saved original question,
+        # without moving its historical date window or granting fresh budget.
+        explicit_scope = query_scope(data["original_query"])
+        for key in ("optical_change_detection", "remote_change_detection", "exclude_radar", "searches"):
+            data["scope"][key] = explicit_scope[key]
+    data["schema_version"] = 2
     for key, default in {"queue": [], "visited": [], "history": [], "requests_used": 0,
                          "documents_used": 0, "recursive_queries_used": 0,
                          "elapsed_seconds": 0.0, "batches_started": 0}.items():
@@ -81,11 +90,73 @@ def _remaining_reason(data, limits):
     return None
 
 
-def _node(query, depth, parent, *, recursive=False, evidence_ids=None):
+def _start_batch(data, limits, supplementary):
+    """Persist batch allowances so a cancellation/resume cannot refresh them."""
+    batch = data.get("active_batch")
+    if batch and batch.get("status") == "running":
+        for key in ("max_batch_queries", "max_batch_requests", "max_batch_documents", "max_batch_seconds", "max_batch_papers"):
+            batch["limits"][key] = min(batch["limits"].get(key, limits[key]), limits[key])
+        # A pre-source-cap snapshot cannot claim previously acquired sources free.
+        batch.setdefault("papers_start", 0)
+        batch.setdefault("papers_added", data.get("papers_count", 0))
+        return batch
+    legacy = bool(data["queue"])
+    if not legacy:
+        data["batches_started"] += 1
+    batch = {"id": "batch_" + str(data["batches_started"]), "status": "running",
+             "origin": "supplementary" if supplementary else "initial",
+             "limits": {key: limits[key] for key in ("max_batch_queries", "max_batch_requests", "max_batch_documents", "max_batch_seconds", "max_batch_papers")},
+             "requests_start": 0 if legacy else data["requests_used"],
+             "documents_start": 0 if legacy else data["documents_used"],
+             "elapsed_seconds": float(data["elapsed_seconds"]) if legacy else 0.0,
+             "papers_start": 0 if legacy else data.get("papers_count", 0),
+             "papers_added": data.get("papers_count", 0) if legacy else 0,
+             "queries_started": 0, "legacy_usage_included": legacy}
+    if legacy:
+        # Old snapshots did not separate batch usage. Count all recorded work
+        # conservatively; never treat the interrupted batch as fresh allowance.
+        batch["queries_started"] = len(data["history"])
+        for node in data["queue"]:
+            if node.get("status") != "pending":
+                node["batch_id"] = batch["id"]
+                batch["queries_started"] += 1
+    data["active_batch"] = batch
+    return batch
+
+
+def _batch_reason(data, batch, *, elapsed=0.0, next_node=None):
+    limits = batch["limits"]
+    for used, start, maximum in (("requests_used", "requests_start", "max_batch_requests"),
+                                  ("documents_used", "documents_start", "max_batch_documents")):
+        if data[used] - batch[start] >= limits[maximum]:
+            return maximum
+    if batch["elapsed_seconds"] + elapsed >= limits["max_batch_seconds"]:
+        return "max_batch_seconds"
+    if batch["papers_added"] >= limits["max_batch_papers"]:
+        return "max_batch_papers"
+    if (next_node is not None and next_node.get("batch_id") != batch["id"]
+            and batch["queries_started"] >= limits["max_batch_queries"]):
+        return "max_batch_queries"
+    return None
+
+
+def _defer_batch_queue(data, reason):
+    """Yield control to Analysis without letting stale queries precede its tasks."""
+    for node in data["queue"]:
+        node.update(status="deferred", defer_reason=reason)
+        data["history"].append(node)
+        # Not visited: Analysis/Review may explicitly authorize this query later.
+    data["queue"] = []
+
+
+def _node(query, depth, parent, *, recursive=False, evidence_ids=None, tasks=None):
     key = query_key(query) if query else "__initial__"
     return {"id": "search_" + hashlib.sha256((str(parent) + ':' + key).encode()).hexdigest()[:16],
             "key": key, "query": query, "depth": depth, "parent_id": parent,
             "parent_evidence_ids": list(evidence_ids or []), "recursive": recursive,
+            "task_ids": list(dict.fromkeys(t["task_id"] for t in (tasks or []) if t.get("task_id"))),
+            "section_ids": list(dict.fromkeys(t["section_id"] for t in (tasks or []) if t.get("section_id"))),
+            "question_ids": list(dict.fromkeys(t["question_id"] for t in (tasks or []) if t.get("question_id"))),
             "status": "pending", "charged": False}
 
 
@@ -162,36 +233,52 @@ async def collect_scientific_evidence(agent, state, *, queries=None, supplementa
     """
     data = ensure_retrieval_state(state)
     limits = retrieval_limits(state)
-    started = time.monotonic()
-    remaining = max(0, limits["max_seconds"] - float(data["elapsed_seconds"]))
-    deadline = started + remaining
-    budget = RetrievalBudget(data, limits, deadline=deadline)
     if not state.get("search_web", True):
         return data
+    data["papers_count"] = len(state["papers"])
+    batch = _start_batch(data, limits, supplementary)
+    started = time.monotonic()
+    remaining = max(0, min(limits["max_seconds"] - float(data["elapsed_seconds"]),
+                           batch["limits"]["max_batch_seconds"] - batch["elapsed_seconds"]))
+    deadline = started + remaining
+    effective_limits = {**limits,
+        "max_requests": min(limits["max_requests"], batch["requests_start"] + batch["limits"]["max_batch_requests"]),
+        "max_documents": min(limits["max_documents"], batch["documents_start"] + batch["limits"]["max_batch_documents"])}
+    budget = RetrievalBudget(data, effective_limits, deadline=deadline)
     if data.get("legacy_usage_estimate") and not data.get("migration_notified"):
         _event(agent, state, message="旧检查点已保留回合计数，并为未计量的历史检索保守预留预算。", migration=data["legacy_usage_estimate"])
         data["migration_notified"] = True
     # A nonempty queue is a resumed batch, not permission to enqueue it again.
     if not data["queue"]:
-        inputs = list(queries or [data["original_query"]])[:3] if supplementary else [None]
+        tasks = state.get("active_retrieval_tasks", []) if supplementary else state.get("research_tasks", [])
+        inputs = (list(queries or [data["original_query"]])[:3] if supplementary else
+                  list(dict.fromkeys(t["query"] for t in tasks if t.get("query")))[:limits["max_initial_queries"]] or [None])
         known = set(data["visited"])
         for query in inputs:
             focus = focus_query(data, query)
-            node = _node(focus, 0, None)
+            node = _node(focus, 0, None, tasks=[t for t in tasks if t.get("query") == query])
             if node["key"] not in known:
                 data["queue"].append(node)
                 known.add(node["key"])
-        data["batches_started"] += 1
     try:
         while data["queue"]:
             reason = _remaining_reason(data, limits)
-            if reason or time.monotonic() >= deadline:
+            elapsed = max(0.0, time.monotonic() - started)
+            if reason or data["elapsed_seconds"] + elapsed >= limits["max_seconds"]:
                 data["stop_reason"] = reason or "max_seconds"
+                data["budget_scope"] = "total"
                 break
             node = data["queue"][0]
             if node["key"] in data["visited"]:
                 data["queue"].pop(0)
                 continue
+            reason = _batch_reason(data, batch, elapsed=elapsed, next_node=node)
+            if reason:
+                data.update(stop_reason=reason, budget_scope="batch")
+                break
+            if node.get("batch_id") != batch["id"]:
+                node["batch_id"] = batch["id"]
+                batch["queries_started"] += 1
             if node["recursive"] and not node["charged"]:
                 if data["recursive_queries_used"] >= limits["max_queries"]:
                     node["status"] = "query_budget"
@@ -204,11 +291,29 @@ async def collect_scientific_evidence(agent, state, *, queries=None, supplementa
                 node.setdefault("gained_evidence_ids", [])
                 _event(agent, state, message="追溯科研来源" if node["recursive"] else "检索科研文献",
                        query=node["query"] or data["original_query"], depth=node["depth"], parent_id=node["parent_id"],
-                       recursive_queries_used=data["recursive_queries_used"], requests_used=data["requests_used"])
+                       recursive_queries_used=data["recursive_queries_used"], requests_used=data["requests_used"],
+                       batch_id=batch["id"], batch_queries_started=batch["queries_started"])
 
                 def merge(rows):
-                    merged = merge_scientific_papers(state, rows, max_papers=limits["max_papers"])
+                    before_count = len(state["papers"])
+                    room = max(0, batch["limits"]["max_batch_papers"] - batch["papers_added"])
+                    # The same cap applies to cached and live provider pages.
+                    # Existing source upgrades remain allowed even when full.
+                    merged = merge_scientific_papers(state, rows,
+                        max_papers=min(limits["max_papers"], before_count + room))
+                    after_count = len(state["papers"])
+                    batch["papers_added"] += max(0, after_count - before_count)
+                    data["papers_count"] = after_count
                     node["gained_evidence_ids"] = list(dict.fromkeys(node["gained_evidence_ids"] + merged["added"] + merged["upgraded"]))
+                    identities = {canonical_source(row) for row in rows}
+                    titles = {re.sub(r"\W+", "", str(row.get("title", "")).casefold()) for row in rows}
+                    for eid, evidence in state["evidence_ledger"].items():
+                        if evidence.get("document_id") or not (canonical_source(evidence) in identities or
+                                re.sub(r"\W+", "", str(evidence.get("title", "")).casefold()) in titles):
+                            continue
+                        links = state.setdefault("retrieval_evidence_links", {}).setdefault(eid, {})
+                        for field in ("task_ids", "section_ids", "question_ids"):
+                            links[field] = list(dict.fromkeys(links.get(field, []) + node.get(field, [])))
 
                 try:
                     timeout = min(limits["query_timeout_seconds"], max(.01, deadline - time.monotonic()))
@@ -230,7 +335,9 @@ async def collect_scientific_evidence(agent, state, *, queries=None, supplementa
                     state["literature_errors"].append({"query": node["query"], "reason": "来源检索失败：" + type(exc).__name__})
             gained = node.get("gained_evidence_ids", [])
             if (node["status"] == "planning" and gained and limits["enabled"] and node["depth"] < limits["max_depth"]
-                    and data["recursive_queries_used"] < limits["max_queries"] and not _remaining_reason(data, limits)):
+                    and data["recursive_queries_used"] < limits["max_queries"] and not _remaining_reason(data, limits)
+                    and batch["queries_started"] < batch["limits"]["max_batch_queries"]
+                    and not _batch_reason(data, batch, elapsed=max(0.0, time.monotonic() - started))):
                 proposal_timeout = min(limits["proposal_timeout_seconds"], max(.01, deadline - time.monotonic()))
                 try:
                     proposals = await _propose(agent, state, node, gained, limits, proposal_timeout)
@@ -247,6 +354,8 @@ async def collect_scientific_evidence(agent, state, *, queries=None, supplementa
                     if data["recursive_queries_used"] + reserved >= limits["max_queries"]:
                         break
                     child = _node(item["query"], node["depth"] + 1, node["id"], recursive=True, evidence_ids=item["evidence_ids"])
+                    for field in ("task_ids", "section_ids", "question_ids"):
+                        child[field] = list(node.get(field, []))
                     if child["key"] in known:
                         continue
                     child["reason"] = item["reason"]
@@ -261,10 +370,27 @@ async def collect_scientific_evidence(agent, state, *, queries=None, supplementa
                    depth=node["depth"], branch_status=node["status"], gained_sources=len(gained),
                    requests_used=data["requests_used"], documents_used=data["documents_used"])
     finally:
-        data["elapsed_seconds"] += max(0.0, time.monotonic() - started)
-    data["stop_reason"] = _remaining_reason(data, limits) or ("batch_complete" if not data["queue"] else data.get("stop_reason"))
+        elapsed = max(0.0, time.monotonic() - started)
+        data["elapsed_seconds"] += elapsed
+        batch["elapsed_seconds"] += elapsed
+    # Cancellation propagates before this block, retaining the active batch and
+    # exact queue. Normal batch exhaustion yields to Analysis and frees the next
+    # batch to enqueue its approved queries, without resetting global counters.
+    total_reason = _remaining_reason(data, limits)
+    batch_reason = _batch_reason(data, batch, next_node=data["queue"][0] if data["queue"] else None)
+    data["stop_reason"] = total_reason or batch_reason or "batch_complete"
+    data["budget_scope"] = "total" if total_reason else "batch" if batch_reason else None
+    if batch_reason and not total_reason:
+        _defer_batch_queue(data, batch_reason)
+    batch.update(status="completed", stop_reason=data["stop_reason"], budget_scope=data["budget_scope"],
+                 requests_used=data["requests_used"] - batch["requests_start"],
+                 documents_used=data["documents_used"] - batch["documents_start"])
+    data.setdefault("batch_history", []).append(copy.deepcopy(batch))
     data["papers_count"] = len(state["papers"])
     data["paper_limit"] = limits["max_papers"]
     if data["stop_reason"] != "batch_complete":
-        _event(agent, state, message="科研检索达到本研究预算，保留已有证据交由审核判断。", stop_reason=data["stop_reason"])
+        message = ("本批科研检索达到上限，保留全研究剩余额度交由分析/审核决定补检。"
+                   if data["budget_scope"] == "batch" else "科研检索达到本研究总预算，保留已有证据交由分析/审核判断。")
+        _event(agent, state, message=message, stop_reason=data["stop_reason"], budget_scope=data["budget_scope"],
+               batch_id=batch["id"], requests_used=data["requests_used"], documents_used=data["documents_used"])
     return data

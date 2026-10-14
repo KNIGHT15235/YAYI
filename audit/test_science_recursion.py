@@ -240,7 +240,8 @@ class RecursionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(collect.call_args.args[0], QUERY)
 
     async def test_depth_branch_and_study_query_budgets_survive_new_batches(self):
-        s, a = state(max_queries=8, max_depth=2, max_branches=2), agent()
+        # Isolate recursive depth/total-query limits from the production batch cap.
+        s, a = state(max_queries=8, max_depth=2, max_branches=2, max_batch_queries=20), agent()
         index = 0
         async def fetch(*args, **kwargs):
             nonlocal index
@@ -345,6 +346,217 @@ class RecursionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(s["papers"]), 1)
         self.assertEqual(s["science_retrieval"]["history"][0]["status"], "timeout")
         self.assertEqual(s["science_retrieval"]["queue"], [])
+
+
+class BatchBudgetTests(unittest.IsolatedAsyncioTestCase):
+    def test_default_three_batches_leave_review_capacity(self):
+        limits = retrieval.retrieval_limits(state())
+        for batch_key, total_key in (("max_batch_requests", "max_requests"),
+                                     ("max_batch_documents", "max_documents"),
+                                     ("max_batch_seconds", "max_seconds"),
+                                     ("max_batch_papers", "max_papers")):
+            self.assertLess(3 * limits[batch_key], limits[total_key])
+
+    async def test_each_batch_retains_at_most_sixty_new_sources_without_dropping_old_evidence(self):
+        s, a = state(enabled=False), agent()
+        counter = [0]
+        async def fetch(*args, **kwargs):
+            start = counter[0] * 100
+            counter[0] += 1
+            kwargs["budget"].charge("request")
+            rows = [paper(start + index) for index in range(100)]
+            kwargs["on_papers"](rows)
+            return rows  # Re-merging a completed page must not charge sources twice.
+        with patch.object(retrieval, "collect_literature", side_effect=fetch):
+            await retrieval.collect_scientific_evidence(a, s)
+            old_ids = set(s["evidence_ledger"])
+            self.assertEqual(len(old_ids), 60)
+            self.assertEqual(s["science_retrieval"]["stop_reason"], "max_batch_papers")
+            await retrieval.collect_scientific_evidence(a, s, queries=["approved new sources"], supplementary=True)
+        data = s["science_retrieval"]
+        self.assertEqual(len(s["papers"]), 120)
+        self.assertTrue(old_ids.issubset(s["evidence_ledger"]))
+        self.assertEqual([batch["papers_added"] for batch in data["batch_history"]], [60, 60])
+        self.assertEqual(data["active_batch"]["papers_start"], 60)
+        self.assertEqual(data["paper_limit"], 200)
+
+    async def test_cached_provider_page_obeys_source_cap_without_http(self):
+        s, a = state(enabled=False), agent()
+        s["research_profile"]["min_papers"] = 60
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        response = Mock(status_code=200)
+        response.json.return_value = {"message": {"items": [crossref(index) for index in range(100)]}}
+        client.get.return_value = response
+        with tempfile.TemporaryDirectory() as tmp, patch.object(sources, "CACHE_DIR", Path(tmp)), \
+             patch.object(sources.httpx, "AsyncClient", return_value=client), \
+             patch.object(sources, "_arxiv", new=AsyncMock(return_value=[])), \
+             patch.object(sources.asyncio, "sleep", new=AsyncMock()):
+            await sources.collect_literature(QUERY, 60)  # Seed a synthetic cache through the real adapter.
+            client.get.reset_mock()
+            await retrieval.collect_scientific_evidence(a, s)
+        client.get.assert_not_awaited()
+        self.assertEqual(s["science_retrieval"]["requests_used"], 0)
+        self.assertEqual(s["science_retrieval"]["active_batch"]["papers_added"], 60)
+        self.assertEqual(len(s["papers"]), 60)
+        self.assertEqual(s["science_retrieval"]["stop_reason"], "max_batch_papers")
+
+    async def test_source_allowance_survives_resume_and_upgrades_do_not_spend_new_source_capacity(self):
+        s, a = state(enabled=False, max_batch_papers=2), agent()
+        async def interrupted(*args, **kwargs):
+            kwargs["on_papers"]([paper(1, abstract="", evidence_level="metadata")])
+            raise asyncio.CancelledError()
+        with patch.object(retrieval, "collect_literature", side_effect=interrupted):
+            with self.assertRaises(asyncio.CancelledError):
+                await retrieval.collect_scientific_evidence(a, s)
+        old_id = next(iter(s["evidence_ledger"]))
+        s = json.loads(json.dumps(s))
+        s["research_profile"]["science_retrieval"]["max_batch_papers"] = 60
+        with patch.object(retrieval, "collect_literature", new=AsyncMock(return_value=[paper(1), paper(2), paper(3)])):
+            await retrieval.collect_scientific_evidence(a, s)
+        self.assertEqual(s["science_retrieval"]["active_batch"]["papers_added"], 2)
+        self.assertEqual(s["science_retrieval"]["active_batch"]["limits"]["max_batch_papers"], 2)
+        self.assertEqual(len(s["papers"]), 2)
+        self.assertEqual(s["evidence_ledger"][old_id]["evidence_level"], "abstract")
+        self.assertEqual(s["science_retrieval"]["stop_reason"], "max_batch_papers")
+
+    async def test_initial_batch_preserves_total_budget_and_deferred_task_semantics(self):
+        s, a = state(enabled=False), agent()
+        s["research_tasks"] = [{"query": f"initial query {i}", "task_id": f"task_{i}",
+                                "section_id": f"section_{i}", "question_id": f"question_{i}"} for i in range(6)]
+        captured = []
+        async def fetch(*args, **kwargs):
+            captured.append(kwargs["search_terms"][0])
+            kwargs["budget"].charge("request")
+            for _ in range(180):
+                kwargs["budget"].charge("document")
+            return [paper(len(captured))]
+        with patch.object(retrieval, "collect_literature", side_effect=fetch):
+            await retrieval.collect_scientific_evidence(a, s)
+        data = s["science_retrieval"]
+        self.assertEqual(captured, [f"initial query {i}" for i in range(3)])
+        self.assertEqual((data["requests_used"], data["documents_used"]), (3, 540))
+        self.assertEqual(data["stop_reason"], "max_batch_queries")
+        self.assertEqual(data["budget_scope"], "batch")
+        self.assertIsNone(retrieval._remaining_reason(data, retrieval.retrieval_limits(s)))
+        self.assertEqual(data["queue"], [])
+        deferred = [node for node in data["history"] if node["status"] == "deferred"]
+        self.assertEqual(len(deferred), 3)
+        self.assertEqual(deferred[0]["section_ids"], ["section_3"])
+        self.assertNotIn(deferred[0]["key"], data["visited"])
+        self.assertEqual(len(s["research_tasks"]), 6)
+
+    async def test_analysis_approved_query_runs_in_next_batch_then_reanalyzes(self):
+        from service.deep_research_v2 import science_roles
+        from service.deep_research_v2.state import create_initial_state
+        s, a = state(enabled=False, max_batch_queries=1), agent()
+        s = {**create_initial_state(QUERY, "offline-batch", search_web=True), **s}
+        a.name = "OfflineAgent"
+        s["research_profile"]["min_papers"] = 2
+        s["research_tasks"] = [{"query": "first initial"}, {"query": "deferred initial"}]
+        captured = []
+        async def fetch(*args, **kwargs):
+            captured.append(kwargs["search_terms"][0])
+            kwargs["budget"].charge("request")
+            kwargs["budget"].charge("document")
+            return [paper(len(captured))]
+        reflection = {"hypotheses": [], "insights": [], "critical_gaps": [], "limitations": [], "section_evidence": []}
+        with patch.object(retrieval, "collect_literature", side_effect=fetch), \
+             patch.object(science_roles, "json_call", new=AsyncMock(return_value=reflection)):
+            await retrieval.collect_scientific_evidence(a, s)
+            await science_roles.analyze_science(a, s)
+            self.assertEqual(s["phase"], "re_researching")
+            pending = s["pending_search_queries"][:]
+            expected = retrieval.focus_query(s["science_retrieval"], pending[0])
+            await retrieval.collect_scientific_evidence(a, s, queries=pending, supplementary=True)
+            await science_roles.analyze_science(a, s)
+        self.assertEqual(captured, ["first initial", expected])
+        self.assertEqual(s["phase"], "analyzing")
+        self.assertEqual(s["analysis_decision"], "pass")
+        self.assertEqual(s["science_retrieval"]["requests_used"], 2)
+        self.assertEqual(s["science_retrieval"]["batch_history"][1]["requests_start"], 1)
+
+    async def test_document_batch_budget_keeps_partial_page_and_total_reserve(self):
+        s, a = state(enabled=False), agent()
+        async def fetch(*args, **kwargs):
+            kwargs["budget"].charge("request")
+            kwargs["on_papers"]([paper()])
+            for _ in range(601):
+                kwargs["budget"].charge("document")
+        with patch.object(retrieval, "collect_literature", side_effect=fetch):
+            await retrieval.collect_scientific_evidence(a, s)
+        data = s["science_retrieval"]
+        self.assertEqual(data["documents_used"], 600)
+        self.assertEqual(data["stop_reason"], "max_batch_documents")
+        self.assertEqual(data["budget_scope"], "batch")
+        self.assertEqual(len(s["papers"]), 1)
+        self.assertIsNone(retrieval._remaining_reason(data, retrieval.retrieval_limits(s)))
+
+    async def test_cancelled_batch_resume_cannot_refresh_or_increase_allowance(self):
+        s, a = state(enabled=False, max_batch_requests=2), agent()
+        async def interrupted(*args, **kwargs):
+            kwargs["budget"].charge("request")
+            kwargs["on_papers"]([paper()])
+            raise asyncio.CancelledError()
+        with patch.object(retrieval, "collect_literature", side_effect=interrupted):
+            with self.assertRaises(asyncio.CancelledError):
+                await retrieval.collect_scientific_evidence(a, s)
+        original_id = s["science_retrieval"]["active_batch"]["id"]
+        s = json.loads(json.dumps(s))
+        s["research_profile"]["science_retrieval"]["max_batch_requests"] = 9
+        async def resumed(*args, **kwargs):
+            kwargs["budget"].charge("request")
+            kwargs["budget"].charge("request")  # Must stop at the original batch allowance of two.
+        with patch.object(retrieval, "collect_literature", side_effect=resumed):
+            await retrieval.collect_scientific_evidence(a, s)
+        data = s["science_retrieval"]
+        self.assertEqual(data["requests_used"], 2)
+        self.assertEqual(data["active_batch"]["id"], original_id)
+        self.assertEqual(data["active_batch"]["queries_started"], 1)
+        self.assertEqual(data["active_batch"]["limits"]["max_batch_requests"], 2)
+        self.assertEqual(data["stop_reason"], "max_batch_requests")
+        self.assertEqual(len(s["papers"]), 1)
+
+    async def test_batch_time_survives_resume_without_counting_idle_time(self):
+        s, a = state(enabled=False), agent()
+        clock = [1000.0]
+        async def interrupted(*args, **kwargs):
+            kwargs["budget"].charge("request")
+            clock[0] += 120
+            raise asyncio.CancelledError()
+        timer = SimpleNamespace(monotonic=lambda: clock[0])
+        with patch.object(retrieval, "time", timer), patch.object(sources, "time", timer):
+            with patch.object(retrieval, "collect_literature", side_effect=interrupted):
+                with self.assertRaises(asyncio.CancelledError):
+                    await retrieval.collect_scientific_evidence(a, s)
+            clock[0] += 1000  # Offline pause is not new active execution budget.
+            async def resumed(*args, **kwargs):
+                self.assertEqual(kwargs["budget"].deadline - clock[0], 60)
+                kwargs["budget"].charge("request")
+                clock[0] += 61
+                return [paper()]
+            with patch.object(retrieval, "collect_literature", side_effect=resumed):
+                await retrieval.collect_scientific_evidence(a, s)
+        self.assertEqual(s["science_retrieval"]["elapsed_seconds"], 181)
+        self.assertEqual(s["science_retrieval"]["active_batch"]["elapsed_seconds"], 181)
+        self.assertEqual(s["science_retrieval"]["stop_reason"], "max_batch_seconds")
+        self.assertEqual(s["science_retrieval"]["budget_scope"], "batch")
+
+    async def test_legacy_queue_uses_recorded_consumption_without_resetting_totals(self):
+        s, a = state(enabled=False, max_batch_requests=2), agent()
+        data = retrieval.ensure_retrieval_state(s)
+        data.update(requests_used=2, documents_used=50, elapsed_seconds=12, batches_started=1)
+        data["queue"] = [retrieval._node("legacy unfinished query", 0, None)]
+        data["queue"][0]["status"] = "running"
+        with patch.object(retrieval, "collect_literature", new=AsyncMock()) as fetch:
+            await retrieval.collect_scientific_evidence(a, s)
+        fetch.assert_not_awaited()
+        self.assertEqual((data["requests_used"], data["documents_used"]), (2, 50))
+        self.assertGreaterEqual(data["elapsed_seconds"], 12)
+        self.assertTrue(data["active_batch"]["legacy_usage_included"])
+        self.assertEqual(data["stop_reason"], "max_batch_requests")
+        self.assertEqual(data["budget_scope"], "batch")
+        self.assertEqual(data["history"][-1]["status"], "deferred")
 
 
 if __name__ == "__main__":

@@ -1110,7 +1110,8 @@ URL: {url}
 
         return self.parse_json_response(response)
 
-    async def _execute_local_search(self, query: str, top_k: int = 10, kb_name: str = None) -> List[Dict]:
+    async def _execute_local_search(self, query: str, top_k: int = 10, kb_name: str = None,
+                                    user_id: str = None, knowledge_base_id: str = None) -> List[Dict]:
         """
         执行本地知识库搜索 - 使用 Milvus 向量检索
 
@@ -1133,7 +1134,8 @@ URL: {url}
             # 复用上传接口对应的索引命名和 embedding 形状。
             from service.retrieval_service import retrieve_from_knowledge_base
             results = await asyncio.to_thread(
-                retrieve_from_knowledge_base, kb_name, query, top_k
+                retrieve_from_knowledge_base, kb_name, query, top_k,
+                user_id=user_id, knowledge_base_id=knowledge_base_id
             )
 
             # 格式化结果为与网络搜索一致的格式

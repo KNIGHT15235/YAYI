@@ -118,7 +118,7 @@ export interface ChunkInfo {
   index: number
   content: string
   chunk_id?: string
-  document_version?: number
+  document_version?: number | string
   locators?: DocumentLocator[]
   assets?: DocumentAsset[]
   evidence_id?: string
@@ -143,7 +143,7 @@ export interface DocumentAsset {
   locator?: DocumentLocator
   download_url?: string
   content_hash?: string
-  document_version?: number
+  document_version?: number | string
 }
 
 /**
@@ -207,8 +207,10 @@ export async function downloadDocumentFile(kbId: string, docId: string): Promise
   return response.blob()
 }
 
-export function getDocumentAssets(kbId: string, docId: string) {
-  return request.get<{ document_id: string; assets: DocumentAsset[] }>(`/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(docId)}/assets`, { loading: false })
+export function getDocumentAssets(kbId: string, docId: string, documentVersion?: number | string) {
+  return request.get<{ document_id: string; assets: DocumentAsset[] }>(`/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(docId)}/assets`, {
+    loading: false, params: documentVersion == null ? undefined : { document_version: documentVersion },
+  })
 }
 
 export async function downloadDocumentAsset(kbId: string, docId: string, assetId: string): Promise<Blob> {

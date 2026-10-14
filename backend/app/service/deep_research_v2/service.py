@@ -93,7 +93,8 @@ class DeepResearchV2Service:
         resume: bool = False,
         user_id: Optional[str] = None,
         search_web: bool = True,
-        search_local: bool = False
+        search_local: bool = False,
+        knowledge_base_id: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """
         执行深度研究（SSE 流式输出）
@@ -126,17 +127,18 @@ class DeepResearchV2Service:
                 user_id=user_id,
                 search_web=search_web,
                 search_local=search_local,
-                kb_name=kb_name
+                kb_name=kb_name,
+                knowledge_base_id=knowledge_base_id,
             )) as events:
                 async for event in events:
                     # 转换为 SSE 格式；连接关闭时显式关闭下层生成器。
-                    yield self._format_sse(event)
+                    yield self._format_sse({**event, "run_id": session_id, "session_id": session_id})
 
         except Exception as e:
             logger.error(f"Research error: {e}")
             yield self._format_sse({
                 "type": "error",
-                "content": str(e)
+                "content": str(e), "run_id": session_id, "session_id": session_id,
             })
 
         # 发送结束标记

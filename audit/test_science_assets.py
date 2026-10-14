@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from uuid import uuid4
 from unittest.mock import Mock, patch
 
@@ -202,6 +203,51 @@ class AssetDatabaseTests(unittest.TestCase):
         rows = [{"id": result["provenance"][0]["chunk_id"]}]
         self.assertEqual(assets.enrich_chunks(self.db, "kb_other", rows, self.kb.id)[0]["assets"], [])
         self.assertEqual(assets.enrich_chunks(self.db, "kb_science", rows, uuid4())[0]["assets"], [])
+
+    def test_authorized_hydration_has_full_identity_rows_and_version_binding(self):
+        result = self.add_assets(self.first)
+        rows = [{"id": result["provenance"][0]["chunk_id"], "content": "Method A: 91"}]
+        enriched = assets.enrich_chunks(self.db, "kb_science", rows, self.kb.id, hydrate=True, query="Method A")
+        self.assertEqual(enriched[0]["knowledge_base_id"], str(self.kb.id))
+        self.assertEqual(enriched[0]["document_version"], "v1")
+        self.assertTrue(enriched[0]["assets"][0]["locator"]["table_rows"])
+        self.assertIn("hydration", enriched[0]["assets"][0])
+        asset = self.db.query(DocumentAsset).first()
+        asset.document_version = "v2"
+        self.db.flush()
+        self.assertEqual(assets.enrich_chunks(self.db, "kb_science", rows, self.kb.id, hydrate=True)[0]["assets"], [])
+
+    def test_asset_expansion_checks_owner_document_and_exact_version(self):
+        result = self.add_assets(self.first)
+        identity = result["assets"][0]["asset_id"]
+        value = knowledge_router.get_document_asset_evidence(str(self.kb.id), str(self.first.id), identity,
+            document_version="v1", query="Method A", max_chars=5000, current_user=self.owner, db=self.db)
+        self.assertEqual(value["document_version"], "v1")
+        self.assertTrue(value["locator"]["table_rows"])
+        for user, doc, version in [(self.other, self.first, "v1"), (self.owner, self.second, "v1"),
+                                    (self.owner, self.first, "v2")]:
+            with self.assertRaises(HTTPException) as error:
+                knowledge_router.get_document_asset_evidence(str(self.kb.id), str(doc.id), identity,
+                    document_version=version, query="", max_chars=5000, current_user=user, db=self.db)
+            self.assertEqual(error.exception.status_code, 404)
+
+    def test_research_retrieval_rechecks_owner_before_hydration(self):
+        from service.retrieval_service import retrieve_from_knowledge_base
+        result = self.add_assets(self.first)
+        hits = [{"id": result["provenance"][0]["chunk_id"], "doc_id": str(self.first.id),
+                 "content": "Method A: 91", "filename": "same.pdf"}]
+        with patch("core.database.SessionLocal", side_effect=lambda: nullcontext(self.db)), \
+                patch("service.retrieval_service.search_chunks", return_value={"results": hits}) as search:
+            rows = retrieve_from_knowledge_base("science", "Method A", user_id=str(self.owner.id), knowledge_base_id=str(self.kb.id))
+            self.assertEqual(rows[0]["knowledge_base_id"], str(self.kb.id))
+            self.assertTrue(rows[0]["assets"][0]["locator"]["table_rows"])
+            before = search.call_count
+            with self.assertRaises(HTTPException):
+                retrieve_from_knowledge_base("science", "Method A", user_id=str(self.other.id))
+            self.assertEqual(search.call_count, before)
+            with self.assertRaises(ValueError):
+                retrieve_from_knowledge_base("science", "Method A", user_id=str(self.owner.id), knowledge_base_id=str(uuid4()))
+            self.assertEqual(search.call_count, before)
 
     def test_asset_list_and_download_check_owner_and_document_binding(self):
         result = self.add_assets(self.first)

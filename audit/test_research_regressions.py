@@ -232,8 +232,8 @@ class ResearchRegressionTests(unittest.IsolatedAsyncioTestCase):
         scout.milvus_service = object()
         result = [{"document_id": "doc1", "document_name": "test.txt", "content_with_weight": "evidence", "score": .9}]
         with patch("service.retrieval_service.retrieve_from_knowledge_base", return_value=result) as retrieve:
-            found = await scout._execute_local_search("query", kb_name="chosen")
-        retrieve.assert_called_once_with("chosen", "query", 10)
+            found = await scout._execute_local_search("query", kb_name="chosen", user_id="owner", knowledge_base_id="kb1")
+        retrieve.assert_called_once_with("chosen", "query", 10, user_id="owner", knowledge_base_id="kb1")
         self.assertEqual(found[0]["title"], "test.txt")
         self.assertEqual(found[0]["summary"], "evidence")
 
@@ -272,6 +272,7 @@ class ResearchRegressionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(research_router, "get_research_service_v2", return_value=service) as factory, \
              patch.object(research_router, "ResearchLease", return_value=lease), \
              patch.object(research_router, "get_checkpoint_service", return_value=MemoryCheckpoint()), \
+             patch.object(research_router, "clear_cancel_flag"), \
              patch.object(research_router, "_validate_local"):
             request = research_router.ResearchRequest(query="audit", max_iterations=1, search_modes=["local"], kb_name="chosen")
             response = await research_router.stream_research(request, current_user=Mock(id="audit-user"), db=Mock())

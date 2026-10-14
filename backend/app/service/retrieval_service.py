@@ -10,6 +10,7 @@
 from typing import List, Dict, Any, Optional
 import logging
 import math
+from contextlib import nullcontext
 from service.milvus_service import get_milvus_service
 from service.embedding_service import generate_embedding, rerank_similarity
 
@@ -45,6 +46,7 @@ def retrieve_content(
     question: str,
     top_k: int = 10,
     kb_id: Optional[str] = None,
+    *, knowledge_base_id=None, hydrate=False, db=None,
 ) -> List[Dict[str, Any]]:
     """
     检索相关内容
@@ -62,8 +64,13 @@ def retrieve_content(
         results = search_chunks(indexNames, question, top_k, kb_id)["results"]
         from core.database import SessionLocal
         from service.document_assets import enrich_chunks
-        with SessionLocal() as db:
-            results = enrich_chunks(db, indexNames, results)
+        with (nullcontext(db) if db is not None else SessionLocal()) as session:
+            results = enrich_chunks(session, indexNames, results, knowledge_base_id,
+                                    hydrate=hydrate, query=question)
+        if knowledge_base_id is not None:
+            # Orphan / legacy vectors do not prove a document-version binding.
+            # They must be reingested before participating in precise research.
+            results = [row for row in results if row.get("knowledge_base_id") == str(knowledge_base_id)]
 
         # 3. 格式化结果
         extracted_data = []
@@ -71,6 +78,7 @@ def retrieve_content(
             message = {
                 "id": i,
                 "document_id": result.get("document_id", result.get("doc_id", "N/A")),
+                "knowledge_base_id": result.get("knowledge_base_id"),
                 "document_name": result.get("filename", "N/A"),
                 "content_with_weight": result.get("content", ""),
                 "score": result.get("score", 0),
@@ -80,6 +88,9 @@ def retrieve_content(
                 "document_version": result.get("document_version"),
                 "locators": result.get("locators", []),
                 "assets": result.get("assets", []),
+                "asset_ids": result.get("asset_ids", []),
+                "asset_hydration": result.get("asset_hydration", {}),
+                "text_start": result.get("text_start"), "text_end": result.get("text_end"),
                 "evidence_id": result.get("evidence_id"),
                 "content_hash": result.get("content_hash"),
                 "download_url": result.get("download_url"),
@@ -89,6 +100,8 @@ def retrieve_content(
         return extracted_data
 
     except Exception as e:
+        if knowledge_base_id is not None:
+            raise
         print(f"检索错误: {str(e)}")
         import traceback
         traceback.print_exc()
@@ -99,6 +112,7 @@ def retrieve_from_knowledge_base(
     kb_name: str,
     question: str,
     top_k: int = 10,
+    *, user_id=None, knowledge_base_id=None,
 ) -> List[Dict[str, Any]]:
     """
     从知识库检索内容
@@ -111,6 +125,17 @@ def retrieve_from_knowledge_base(
     Returns:
         检索结果列表
     """
-    # 将知识库名称转换为集合名称
+    if user_id is not None:
+        from core.database import SessionLocal
+        from service.knowledge_access import resolve_owned_knowledge_base, collection_for_name
+        with SessionLocal() as db:
+            kb = resolve_owned_knowledge_base(db, user_id, kb_name)
+            if knowledge_base_id is not None and str(kb.id) != str(knowledge_base_id):
+                raise ValueError("知识库身份与已授权研究范围不一致")
+            return retrieve_content(collection_for_name(kb.name), question, top_k,
+                                    knowledge_base_id=kb.id, hydrate=True, db=db)
+    if knowledge_base_id is not None:
+        raise ValueError("读取结构化文献资产需要真实用户身份")
+    # Legacy internal callers retain text retrieval; no full asset hydration.
     collection_name = f"kb_{kb_name}".lower().replace(" ", "_")
     return retrieve_content(collection_name, question, top_k)

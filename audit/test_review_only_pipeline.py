@@ -1,4 +1,4 @@
-"""Offline regressions for Review-owned retrieval and scientific phase routing.
+"""Offline regressions for review repair and dual-loop scientific phase routing.
 
 Network and model outputs are fixtures. These tests validate decisions and state
 transitions, not literature quality or live provider availability.
@@ -36,26 +36,27 @@ def response(row, status="supported", **extra):
 
 
 class ReviewOwnedRetrievalTests(unittest.IsolatedAsyncioTestCase):
-    async def test_analyze_records_source_gap_without_authorizing_search(self):
+    async def test_analyze_authorizes_source_search_without_consuming_review_budget(self):
         state = fixture_state(3)
         add_papers(state, 1)
         state.update(phase="analyzing", iteration=1, analysis_search_round=1)
         before = state["iteration"]
-        await analyze_science(agent(), state)
-        self.assertEqual(state["phase"], "analyzing")
+        with patch(ROLE + ".json_call", new_callable=AsyncMock, return_value={"critical_gaps": [], "limitations": []}):
+            await analyze_science(agent(), state)
+        self.assertEqual(state["phase"], "re_researching")
         self.assertFalse(state["evidence_assessment"]["sufficient"])
         self.assertTrue(state["evidence_assessment"]["missing_questions"])
         self.assertEqual(state["iteration"], before)
-        self.assertEqual(state["analysis_search_round"], 1)
-        self.assertFalse(state.get("pending_search_queries"))
-        self.assertNotEqual(state.get("supplementary_origin"), "analysis")
+        self.assertEqual(state["analysis_search_round"], 2)
+        self.assertTrue(state.get("pending_search_queries"))
+        self.assertEqual(state.get("supplementary_origin"), "analysis")
 
-    async def test_no_evidence_reaches_review_preflight_without_exception(self):
+    async def test_no_evidence_reaches_bounded_search_without_exception(self):
         state = fixture_state(1)
         await analyze_science(agent(), state)
-        self.assertEqual(state["phase"], "reviewing")
-        self.assertTrue(state["review_preflight"])
-        self.assertFalse(state.get("pending_search_queries"))
+        self.assertEqual(state["phase"], "re_researching")
+        self.assertFalse(state["review_preflight"])
+        self.assertTrue(state.get("pending_search_queries"))
         self.assertFalse(state["claims"])
 
     async def test_metadata_only_cannot_reach_writer_as_readable_evidence(self):
@@ -63,11 +64,11 @@ class ReviewOwnedRetrievalTests(unittest.IsolatedAsyncioTestCase):
         state["papers"] = [register_evidence(state, paper(1, abstract="", content="Title " * 50,
                                                        evidence_level="metadata"))]
         await analyze_science(agent(), state)
-        self.assertEqual(state["phase"], "reviewing")
-        self.assertTrue(state["review_preflight"])
+        self.assertEqual(state["phase"], "re_researching")
+        self.assertFalse(state["review_preflight"])
         self.assertEqual(state["evidence_assessment"]["required_evidence"]["content_bearing_sources"], 0)
 
-    async def test_scout_reassesses_hypotheses_even_when_source_count_is_short(self):
+    async def test_analysis_reassesses_hypotheses_even_when_source_count_is_short(self):
         state = fixture_state(3)
         add_papers(state, 1)
         state["hypotheses"] = [{"id": "hyp_1", "content": "孪生卷积网络被使用", "status": "pending"}]
@@ -82,7 +83,7 @@ class ReviewOwnedRetrievalTests(unittest.IsolatedAsyncioTestCase):
         model.assert_awaited_once()
         self.assertEqual(state["hypotheses"][0]["status"], "supported")
         self.assertFalse(state["evidence_assessment"]["sufficient"])
-        self.assertEqual(state["phase"], "analyzing")
+        self.assertEqual(state["phase"], "re_researching")
 
     async def test_review_refreshes_stale_source_assessment_after_supplement(self):
         state = fixture_state(2)
@@ -187,7 +188,8 @@ class ReviewOwnedRetrievalTests(unittest.IsolatedAsyncioTestCase):
             first_round = state["review_search_round"]
             state.update(phase="reviewing", pending_search_queries=[])
             await review_science(agent(), state)
-        self.assertEqual(state["phase"], "revising")
+        self.assertEqual(state["phase"], "completed")
+        self.assertEqual(state["stop_reason"], "no_progress")
         self.assertEqual(state["review_search_round"], first_round)
         self.assertFalse(state["pending_search_queries"])
 
@@ -332,7 +334,7 @@ class CheckpointMigrationTests(unittest.TestCase):
         self.assertFalse(state.get("review_search_history"))
         self.assertFalse(state.get("pending_search_queries"))
 
-    def test_legacy_analysis_search_returns_to_review_without_budget_reset(self):
+    def test_legacy_analysis_search_continues_without_budget_reset(self):
         state = fixture_state(2)
         state.update(phase="re_researching", _next_step="re_researching", supplementary_origin="analysis",
                      pending_search_queries=["old missing evidence"], analysis_search_round=2,
@@ -341,14 +343,13 @@ class CheckpointMigrationTests(unittest.TestCase):
                                         "documents_used": 420, "visited": ["already searched"]})
         prior = copy.deepcopy(state["science_retrieval"])
         migrate_science_policy(state)
-        self.assertEqual((state["phase"], state["_next_step"]), ("reviewing", "reviewing"))
-        self.assertTrue(state["review_preflight"])
-        self.assertEqual(state["pending_search_queries"], [])
-        self.assertEqual(state["legacy_analysis_search_queries"], ["old missing evidence"])
+        self.assertEqual((state["phase"], state["_next_step"]), ("re_researching", "re_researching"))
+        self.assertEqual(state["pending_search_queries"], ["old missing evidence"])
+        self.assertEqual(state["return_phase"], "analyzing")
         self.assertEqual((state["analysis_search_round"], state["iteration"], state["max_iterations"]), (2, 2, 3))
         self.assertEqual(state["science_retrieval"], prior)
         self.assertEqual(state["review_search_round"], 1)
-        self.assertEqual(state["research_profile"]["max_analysis_search_rounds"], 0)
+        self.assertEqual(state["research_profile"]["max_analysis_search_rounds"], 2)
 
     def test_legacy_review_search_keeps_claims_and_returns_via_analysis(self):
         state = fixture_state(1)
@@ -419,13 +420,14 @@ class PhaseRoutingTests(unittest.IsolatedAsyncioTestCase):
             "scout": scout, "data_analyst": lambda st: analyze_science(agent(), st),
             "wizard": lambda st: None, "writer": writer, "critic": lambda st: st.update(phase="completed"),
         })
-        events = await self.run_graph(graph, state)
+        with patch(ROLE + ".json_call", new_callable=AsyncMock, return_value={"critical_gaps": [], "limitations": []}):
+            events = await self.run_graph(graph, state)
         self.assertEqual([name for name, _ in order], ["scout", "data_analyst", "wizard", "writer", "critic"])
         self.assertEqual(events[-1]["type"], "research_complete")
         self.assertFalse(any(event["type"] == "phase" and event["phase"] == "writing" for event in events))
         self.assertTrue(any(st["_next_step"] == "analyzing" for st in snapshots))
 
-    async def test_no_readable_evidence_goes_to_review_before_wizard_or_writer(self):
+    async def test_no_readable_evidence_stops_before_wizard_or_writer(self):
         state = fixture_state(1)
         state.update(phase="analyzing", _next_step="analyzing", search_web=False, search_local=False)
         graph, order, _ = self.graph({
@@ -435,7 +437,7 @@ class PhaseRoutingTests(unittest.IsolatedAsyncioTestCase):
             "writer": lambda st: self.fail("No evidence must not create a draft"),
         })
         events = await self.run_graph(graph, state)
-        self.assertEqual([name for name, _ in order], ["data_analyst", "critic"])
+        self.assertEqual([name for name, _ in order], ["data_analyst"])
         self.assertEqual(events[-1]["type"], "research_complete")
         self.assertIsNone(state["quality_score"])
 
@@ -465,7 +467,7 @@ class PhaseRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshots[-1]["science_retrieval"]["recursive_queries_used"], 3)
         self.assertEqual(snapshots[-1]["science_retrieval"]["requests_used"], 9)
         self.assertEqual(snapshots[-1]["science_retrieval"]["queue"][0]["id"], "pending_source")
-        self.assertEqual(graph.checkpoint_service.update_status.call_args.args[1], "paused")
+        self.assertEqual(snapshots[-1]["_checkpoint_status"], "paused")
 
     async def test_cancel_after_scout_completes_preserves_new_evidence_and_budget(self):
         state = fixture_state(1)

@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 class CheckpointService:
     """检查点服务"""
 
+    supports_atomic_status = True
+
     def __init__(self):
         pass
 
@@ -37,6 +39,8 @@ class CheckpointService:
         user_id: Optional[str] = None,
         ui_state: Optional[Dict[str, Any]] = None,
         final_report: Optional[str] = None,
+        status: str = "running",
+        error_message: Optional[str] = None,
     ) -> Optional[str]:
         """
         保存检查点
@@ -51,6 +55,8 @@ class CheckpointService:
         Returns:
             检查点 ID，失败返回 None
         """
+        if status not in {"running", "paused", "completed", "failed"}:
+            raise ValueError("Invalid research checkpoint status")
         db = self._get_db()
         try:
             # 提取关键信息
@@ -85,8 +91,8 @@ class CheckpointService:
                     existing.ui_state_json = clean_ui_state
                 if final_report is not None:
                     existing.final_report = final_report
-                existing.status = "running"
-                existing.error_message = None
+                existing.status = status
+                existing.error_message = error_message
                 existing.updated_at = datetime.utcnow()
                 checkpoint_id = str(existing.id)
             else:
@@ -100,7 +106,8 @@ class CheckpointService:
                     state_json=clean_state,
                     ui_state_json=clean_ui_state,
                     final_report=final_report,
-                    status="running",
+                    status=status,
+                    error_message=error_message,
                 )
                 db.add(checkpoint)
                 db.flush()
@@ -186,7 +193,8 @@ class CheckpointService:
         finally:
             db.close()
 
-    def get_checkpoint_info(self, session_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_checkpoint_info(self, session_id: str, user_id: Optional[str] = None,
+                            strict: bool = False) -> Optional[Dict[str, Any]]:
         """
         获取检查点信息（不包含完整状态）
 
@@ -207,6 +215,8 @@ class CheckpointService:
 
         except Exception as e:
             logger.error(f"Failed to get checkpoint info: {e}")
+            if strict:
+                raise
             return None
         finally:
             db.close()
@@ -322,7 +332,7 @@ class CheckpointService:
         # Queue 只属于当前事件循环；其余值必须实际转换成 JSON 原生类型，
         # 仅调用 dumps(default=str) 测试后保留原值仍会使 JSONB 写入失败。
         persistent_state = {key: value for key, value in state.items()
-                            if key != "_message_queue"}
+                            if key not in {"_message_queue", "_checkpoint_status", "_checkpoint_error"}}
         return json.loads(json.dumps(persistent_state, default=str))
 
 

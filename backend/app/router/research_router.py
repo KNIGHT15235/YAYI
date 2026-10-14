@@ -126,7 +126,7 @@ def _validate_local(db, user_id, enabled, kb_name):
     if enabled:
         if not kb_name:
             raise HTTPException(422, "本地检索需要选择一个知识库")
-        resolve_owned_knowledge_base(db, user_id, kb_name)
+        return resolve_owned_knowledge_base(db, user_id, kb_name)
 
 def _response(source, lease):
     return StreamingResponse(lease.stream(source), media_type="text/event-stream",
@@ -142,22 +142,40 @@ async def stream_research(request: ResearchRequest,
     if request.session_id:
         authorize_research_session(db, user_id, session_id)
     web, local = request.get_search_web(), request.get_search_local()
-    _validate_local(db, user_id, local, request.kb_name)
+    knowledge_base = _validate_local(db, user_id, local, request.kb_name)
+    knowledge_base_id = str(knowledge_base.id) if knowledge_base is not None else None
     lease = await ResearchLease(user_id, session_id).acquire()
     try:
         checkpoints = get_checkpoint_service()
+        # A chat may contain several runs, but a run/checkpoint must never be
+        # overwritten by an ordinary send. The UI creates a new session for a
+        # new study, or calls /resume for the existing study.
+        try:
+            existing = checkpoints.get_checkpoint_info(session_id, user_id=user_id, strict=True) if request.session_id else None
+        except Exception as error:
+            raise HTTPException(503, "无法确认已有研究状态，未启动新研究，请稍后重试") from error
+        if existing:
+            raise HTTPException(409, {
+                "code": "research_run_exists",
+                "message": "该研究已有检查点；请新建研究会话，或使用继续研究/追加复核，不可覆盖原研究。",
+                "run_id": session_id,
+            })
         state = create_initial_state(request.query, session_id, search_web=web, search_local=local)
-        state.update(kb_name=request.kb_name, max_iterations=request.max_iterations, version=request.version)
+        state.update(kb_name=request.kb_name, knowledge_base_id=knowledge_base_id,
+                     max_iterations=request.max_iterations, version=request.version)
         state.update(profile_id=request.profile_id, research_profile=get_research_profile(request.profile_id, request.min_papers))
         if not checkpoints.save_checkpoint(session_id, state, user_id=user_id, ui_state={}, final_report=""):
             raise HTTPException(503, "检查点保存失败，研究尚未启动")
+        # Clear only the previous run's cancellation before handing the stream
+        # to the client; never erase a new cancellation inside the producer.
+        clear_cancel_flag(session_id)
         if request.version == "v2":
             if request.profile_id == "science" and request.min_papers is None:
                 service = get_research_service_v2(request.max_iterations)
             else:
                 service = get_research_service_v2(request.max_iterations, request.profile_id, request.min_papers)
             source = service.research(query=request.query, session_id=session_id, user_id=user_id,
-                kb_name=request.kb_name, search_web=web, search_local=local)
+                kb_name=request.kb_name, knowledge_base_id=knowledge_base_id, search_web=web, search_local=local)
         else:
             service = get_research_service()["research_service"]
             async def legacy_stream():
@@ -262,12 +280,24 @@ async def resume_research(session_id: str, current_user: User = Depends(get_curr
         state = full.get("state_json") or {}
         if state.get("version") == "v1":
             raise HTTPException(400, "旧版研究不支持阶段恢复，请重新开始")
-        state, recheck = _prepare_bounded_recheck(full, request)
-        _validate_local(db, user_id, state.get("search_local", False), state.get("kb_name"))
-        if recheck and not checkpoints.save_checkpoint(session_id, state, user_id=user_id,
-                ui_state=full.get("ui_state_json") or {}, final_report=state.get("final_report", "")):
-            raise HTTPException(503, "追加审核检查点保存失败，原结果未启动修改")
+        state, _ = _prepare_bounded_recheck(full, request)
+        knowledge_base = _validate_local(db, user_id, state.get("search_local", False), state.get("kb_name"))
+        knowledge_base_id = str(knowledge_base.id) if knowledge_base is not None else None
+        state["knowledge_base_id"] = knowledge_base_id
+        # Publish the resumed lifecycle durably before any model work starts.
+        # Ordinary paused/failed resumes must not keep their old PG status while
+        # the next phase is running. Keep the saved execution position and data.
+        try:
+            saved = checkpoints.save_checkpoint(session_id, state, user_id=user_id,
+                ui_state=full.get("ui_state_json"),
+                final_report=state.get("final_report", full.get("final_report")),
+                status="running", error_message=None)
+        except Exception as error:
+            raise HTTPException(503, "恢复检查点保存失败，研究未启动") from error
+        if not saved:
+            raise HTTPException(503, "恢复检查点保存失败，研究未启动")
         service = get_research_service_v2()
+        clear_cancel_flag(session_id)
         return _response(service.research(query=full.get("query", ""), session_id=session_id,
             resume=True, user_id=user_id), lease)
     except BaseException:

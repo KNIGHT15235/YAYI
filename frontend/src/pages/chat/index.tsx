@@ -10,9 +10,9 @@ import { sessionState } from '@/store/session'
 import { usePageTransport } from '@/utils'
 import { useUnmount } from 'ahooks'
 import { uniqueId } from 'lodash-es'
-import { message as uiMessage, Button, Space, Tag } from 'antd'
+import { message as uiMessage, Button, Space, Tag, Modal, Input, InputNumber, Select, Checkbox, Alert } from 'antd'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router-dom'
 import { proxy, useSnapshot } from 'valtio'
 import ChatMessage from './component/chat-message'
 import Drawer from './component/drawer'
@@ -20,8 +20,11 @@ import Source from './component/source'
 import StepDetailPanel, { StepDetailData } from './component/step-detail-panel'
 import ResearchDetail, { ResearchDetailData, ResearchStep } from './component/research-detail'
 import styles from './index.module.scss'
-import { normalizeReference, readScienceData, checkpointDisplayState } from '@/api/research-types'
-import { createChatId, createChatIdText, transportToChatEnter, mergeCharts, reviewPresentation, withQualityReviewNotice } from './shared'
+import { normalizeReference, readScienceData, mergeScienceData, checkpointDisplayState } from '@/api/research-types'
+import { createChatId, createChatIdText, transportToChatEnter, mergeCharts, upsertResearchStep, completeSupplementarySearch, revisionPresentation, reviewPresentation, withQualityReviewNotice, restoredStepStatus, acceptedResumeCheckpoint, checkpointSearchSelection } from './shared'
+import { ResearchStreamScope } from '@/utils/research-stream'
+import type { Claim } from '@/api/research-types'
+import ClaimEvidenceBoundary from '@/components/claim-evidence-boundary'
 
 async function scrollToBottom() {
   await new Promise((resolve) => setTimeout(resolve))
@@ -42,6 +45,7 @@ async function scrollToBottom() {
 
 export default function Index() {
   const { id } = useParams()
+  const navigate = useNavigate()
   const { data: ctx } = usePageTransport(transportToChatEnter)
   const initialProfile = ctx && ctx.data.sessionId === id ? ctx.data.profileId : null
   const [profileId, setProfileId] = useState<ResearchProfileId | null>(initialProfile)
@@ -91,6 +95,11 @@ export default function Index() {
     deviceActions.setChatting(loading)
   }, [loading])
   useUnmount(() => {
+    operationGenerationRef.current += 1
+    viewIdentityRef.current.generation += 1
+    streamScopeRef.current.close()
+    void readerRef.current?.cancel().catch(() => {})
+    readerRef.current = null
     deviceActions.setChatting(false)
     // 清理轮询
     if (attachmentPollingRef.current) {
@@ -100,10 +109,24 @@ export default function Index() {
 
   // 用于取消请求的 ref
   const readerRef = useRef<ReadableStreamDefaultReader<any> | null>(null)
+  const streamScopeRef = useRef(new ResearchStreamScope())
+  const operationGenerationRef = useRef(0)
+  const sendPendingRef = useRef<number | null>(null)
+  const viewIdentityRef = useRef({ id, generation: 0 })
+  if (viewIdentityRef.current.id !== id) {
+    viewIdentityRef.current = { id, generation: viewIdentityRef.current.generation + 1 }
+  }
+  const stoppingRef = useRef(false)
+  const [stopping, setStopping] = useState(false)
   const currentSessionIdRef = useRef<string | null>(null)
   const [checkpointInfo, setCheckpointInfo] = useState<api.session.ResearchCheckpoint | null>(null)
   const [resuming, setResuming] = useState(false)
   const [savingMemory, setSavingMemory] = useState(false)
+  const [reviewOpen, setReviewOpen] = useState(false)
+  const [reviewNotes, setReviewNotes] = useState('')
+  const [reviewClaimIds, setReviewClaimIds] = useState<string[]>([])
+  const [additionalIterations, setAdditionalIterations] = useState(1)
+  const [useRemainingBudget, setUseRemainingBudget] = useState(false)
   const resumeLock = useRef(false)
   const loadCheckpointRef = useRef<() => Promise<void>>(async () => {})
   const activeSessionRef = useRef(id)
@@ -127,37 +150,50 @@ export default function Index() {
 
   const refreshCheckpointInfo = useCallback(async () => {
     if (!id) return
+    const generation = operationGenerationRef.current
     try {
-      const response = await api.session.getResearchCheckpoint(id)
-      if (activeSessionRef.current === id) setCheckpointInfo(response.data.checkpoint || null)
+      const response = await api.session.getFullResearchCheckpoint(id)
+      if (activeSessionRef.current === id && operationGenerationRef.current === generation) {
+        setCheckpointInfo(response.data.checkpoint || null)
+        restoredCheckpointRef.current = response.data.checkpoint || null
+      }
     } catch { /* 查询失败不会改变已知检查点 */ }
   }, [id])
 
   // 停止生成
   const handleStop = useCallback(async () => {
+    if (stoppingRef.current) return
+    stoppingRef.current = true
+    setStopping(true)
     console.log('[handleStop] 用户点击停止按钮')
+    const stoppedSession = currentSessionIdRef.current || id
+    const stopGeneration = ++operationGenerationRef.current
+    const isCurrentStop = () => activeSessionRef.current === stoppedSession && operationGenerationRef.current === stopGeneration
+    streamScopeRef.current.close()
 
     // 取消读取流
-    if (readerRef.current) {
+    const stoppedReader = readerRef.current
+    readerRef.current = null
+    if (stoppedReader) {
       try {
-        await readerRef.current.cancel()
+        await stoppedReader.cancel()
         console.log('[handleStop] 读取流已取消')
       } catch (e) {
         console.error('[handleStop] 取消读取流失败:', e)
       }
-      readerRef.current = null
     }
 
     // 调用后端取消 API
-    if (currentSessionIdRef.current) {
+    if (stoppedSession) {
       try {
-        await api.session.cancelResearch(currentSessionIdRef.current)
+        await api.session.cancelResearch(stoppedSession)
         console.log('[handleStop] 后端取消请求已发送')
       } catch (e) {
         console.error('[handleStop] 调用取消 API 失败:', e)
       }
     }
 
+    if (!isCurrentStop()) return
     // 停止当前聊天项的加载状态
     const loadingItem = chat.list.find(item => item.loading)
     if (loadingItem) {
@@ -169,10 +205,16 @@ export default function Index() {
 
     // 更新研究步骤状态
     setResearchSteps(prev => prev.map(s =>
-      s.status === 'running' ? { ...s, status: 'completed' as const } : s
+      s.status === 'running' ? { ...s, status: 'paused' as const, subtitle: '已中断，等待检查点确认' } : s
     ))
     await refreshCheckpointInfo()
-  }, [chat, refreshCheckpointInfo])
+    if (isCurrentStop()) {
+      stoppingRef.current = false
+      resumeLock.current = false
+      setStopping(false)
+      setResuming(false)
+    }
+  }, [chat, refreshCheckpointInfo, id])
 
   // 轮询检查附件处理状态
   useEffect(() => {
@@ -260,41 +302,47 @@ export default function Index() {
   }, [])
 
   const sendChat = useCallback(
-    async (target: API.ChatItem, message: string, attachmentIds?: string[], resume = false) => {
+    async (target: API.ChatItem, message: string, attachmentIds?: string[], resume = false, resumeOptions: api.session.ResumeResearchOptions = {}) => {
+      if (!id || activeSessionRef.current !== id) return
+      const ticket = streamScopeRef.current.begin(id)
+      const isCurrent = (runId?: unknown) => activeSessionRef.current === id && streamScopeRef.current.accepts(ticket, runId)
+      currentSessionIdRef.current = id
       setCurrentChatItem(target)
       target.loading = true
       try {
         let res
         if (resume) {
-          res = await api.session.resumeResearch(id!)
+          res = await api.session.resumeResearch(id!, resumeOptions, { signal: ticket.controller.signal })
         } else if (target.type === ChatType.Deepsearch) {
           // A new task carries its choice; history derives its mode only from
           // the saved checkpoint, never from another task or a build default.
           if (!profileLoadedRef.current) await loadCheckpointRef.current()
           if (!profileLoadedRef.current || !researchProfileRef.current) throw new Error('研究模式加载失败，请刷新后重试')
+          if (!isCurrent()) return
           res = await api.session.deepsearch({
             query: message,
             profile_id: researchProfileRef.current,
             session_id: id,  // 传递会话 ID 用于检查点保存
             search_modes: deviceState.searchModes as string[],  // 传递搜索模式
             kb_name: deviceState.knowledgeBaseName || undefined,
-          })
+          }, { signal: ticket.controller.signal })
         } else if (attachmentIds && attachmentIds.length > 0) {
           // 使用带附件的聊天接口
           res = await api.session.chatWithAttachments({
             session_id: id!,
             question: message,
             attachment_ids: attachmentIds,
-          })
+          }, { signal: ticket.controller.signal })
         } else {
           res = await api.session.chat({
             session_id: id!,
             question: message,
-          })
+          }, { signal: ticket.controller.signal })
         }
 
         const reader = res.data.getReader()
         if (!reader) return
+        if (!isCurrent()) { await reader.cancel(); return }
 
         // 存储 reader 和 session ID 用于取消
         readerRef.current = reader
@@ -303,13 +351,16 @@ export default function Index() {
         await read(reader)
 
         // 清理 reader ref
-        readerRef.current = null
+        if (isCurrent()) readerRef.current = null
       } catch (error) {
-        throw error
+        if (isCurrent()) throw error
       } finally {
         target.loading = false
-        readerRef.current = null
-        if (target.type === ChatType.Deepsearch) await refreshCheckpointInfo()
+        if (isCurrent()) {
+          readerRef.current = null
+          currentSessionIdRef.current = null
+          if (target.type === ChatType.Deepsearch) await refreshCheckpointInfo()
+        }
       }
 
       async function read(reader: ReadableStreamDefaultReader<any>) {
@@ -317,6 +368,7 @@ export default function Index() {
         const decoder = new TextDecoder('utf-8')
         while (true) {
           const { value, done } = await reader.read()
+          if (!isCurrent()) { await reader.cancel(); return }
           // 保留跨网络 chunk 的 UTF-8 字节，避免中文和 emoji 被替换为乱码。
           temp += decoder.decode(value, { stream: !done })
 
@@ -352,6 +404,7 @@ export default function Index() {
           }
 
           const json = JSON.parse(str)
+          if (!isCurrent(json.run_id || json.session_id)) return
           if (target.type === ChatType.Deepsearch) {
             // 辅助函数：从 V2 格式中提取实际内容
             const extractContent = (data: any): string => {
@@ -367,6 +420,11 @@ export default function Index() {
 
             // V2 研究开始事件
             if (json.type === 'research_resumed') {
+              // This event is accepted only by the current stream ticket above.
+              // Recheck inside the state updater as React may apply it later.
+              restoredCheckpointRef.current = acceptedResumeCheckpoint(restoredCheckpointRef.current, id!)
+              setCheckpointInfo(previous => isCurrent(json.run_id || json.session_id)
+                ? acceptedResumeCheckpoint(previous, id!) : previous)
               target.reactMode = true
               target.reactSteps ||= []
               target.reactSteps.push({ step: target.reactSteps.length + 1, type: 'thought', content: `▶️ 从 ${json.phase || '检查点'} 继续研究`, timestamp: Date.now() })
@@ -409,26 +467,16 @@ export default function Index() {
               }
 
               setResearchSteps(prev => {
+                if (!isCurrent(json.run_id || json.session_id)) return prev
                 const existing = prev.find(s => s.type === stepType)
-                let newSteps: ResearchStep[]
-                if (existing) {
-                  // 更新现有步骤 - 保持 id 为 stepType
-                  newSteps = prev.map(s => s.type === stepType ? {
-                    ...s,
-                    status: content.status,
-                    stats,
-                  } : s)
-                } else {
-                  // 添加新步骤 - 使用 stepType 作为 id
-                  newSteps = [...prev, {
-                    id: stepType,  // 使用 stepType 作为 id，与 detail key 保持一致
-                    type: stepType,
-                    title: content.title || stepType,
-                    subtitle: content.subtitle || '',
-                    status: content.status || 'running',
-                    stats,
-                  }]
-                }
+                const newSteps = upsertResearchStep<ResearchStep>(prev, {
+                  id: stepType,
+                  type: stepType,
+                  title: content.title || existing?.title || stepType,
+                  subtitle: content.subtitle || '',
+                  status: content.status || 'running',
+                  stats,
+                })
                 // 同步更新 ref，确保后续事件能立即访问
                 researchStepsRef.current = newSteps
                 return newSteps
@@ -566,6 +614,15 @@ export default function Index() {
                 timestamp: Date.now(),
               })
 
+              if (json.phase === 'analyzing') {
+                setResearchSteps(prev => {
+                  if (!isCurrent(json.run_id || json.session_id)) return prev
+                  const next = completeSupplementarySearch(prev, json.phase)
+                  researchStepsRef.current = next
+                  return next
+                })
+              }
+
               // 同时更新研究步骤条 - 映射 phase 到 step_type
               const phaseToStepType: Record<string, ResearchStep['type']> = {
                 writing: 'writing',
@@ -577,38 +634,36 @@ export default function Index() {
               const stepType = phaseToStepType[json.phase]
               if (stepType) {
                 setResearchSteps(prev => {
-                  const existing = prev.find(s => s.type === stepType)
-                  if (!existing) {
-                    const newSteps = [...prev, {
-                      id: stepType,  // 使用 stepType 作为 ID
-                      type: stepType,
+                  if (!isCurrent(json.run_id || json.session_id)) return prev
+                  // A new accepted phase starts another execution of this step,
+                  // including a previously paused/failed/completed revision.
+                  const newSteps = upsertResearchStep<ResearchStep>(prev, {
+                    id: stepType,
+                    type: stepType,
+                    title: phaseLabels[json.phase] || json.phase,
+                    subtitle: extractContent(json.content) || '',
+                    status: 'running',
+                  })
+                  researchStepsRef.current = newSteps
+
+                  // 同时初始化 researchDetail - 使用 stepType 作为 key
+                  if (!researchDetailsRef.current.has(stepType)) {
+                    const newDetail: ResearchDetailData = {
+                      stepId: stepType,
+                      stepType,
                       title: phaseLabels[json.phase] || json.phase,
                       subtitle: extractContent(json.content) || '',
-                      status: 'running' as const,
-                    }]
-                    researchStepsRef.current = newSteps
-
-                    // 同时初始化 researchDetail - 使用 stepType 作为 key
-                    if (!researchDetailsRef.current.has(stepType)) {
-                      const newDetail: ResearchDetailData = {
-                        stepId: stepType,
-                        stepType,
-                        title: phaseLabels[json.phase] || json.phase,
-                        subtitle: extractContent(json.content) || '',
-                        searchResults: [],
-                        charts: [],
-                        streamingReport: '',
-                      }
-                      researchDetailsRef.current.set(stepType, newDetail)
-                      // 对于 writing 步骤，自动选中以便显示过程报告
-                      if (stepType === 'writing') {
-                        setSelectedResearchDetail({ ...newDetail })
-                      }
+                      searchResults: [],
+                      charts: [],
+                      streamingReport: '',
                     }
-
-                    return newSteps
+                    researchDetailsRef.current.set(stepType, newDetail)
+                    // 对于 writing 步骤，自动选中以便显示过程报告
+                    if (stepType === 'writing') {
+                      setSelectedResearchDetail({ ...newDetail })
+                    }
                   }
-                  return prev
+                  return newSteps
                 })
               }
             }
@@ -640,11 +695,12 @@ export default function Index() {
               })
             }
 
-            if (['literature_corpus', 'evidence_assessment', 'hypotheses', 'planning_complete', 'claim_verification'].includes(json.type)) {
+            if (['literature_corpus', 'evidence_assessment', 'hypotheses', 'planning_complete', 'claim_verification', 'report_draft', 'revision_complete'].includes(json.type)) {
               const payload = json.content || json
               const patch = json.type === 'literature_corpus' ? { papers: payload.papers || [], evidenceLedger: payload.evidence_ledger || {} }
                 : json.type === 'evidence_assessment' ? { evidenceAssessment: payload }
                 : ['hypotheses', 'planning_complete'].includes(json.type) ? { hypotheses: payload.hypotheses || [] }
+                : ['report_draft', 'revision_complete'].includes(json.type) ? mergeScienceData(target.scienceData, payload)
                 : { claimVerification: payload, claims: payload.claims || [] }
               target.scienceData = { ...target.scienceData, ...patch }
               let detail = researchDetailsRef.current.get('reviewing')
@@ -710,8 +766,9 @@ export default function Index() {
                 target.reference = json.references.map(normalizeReference)
               }
 
-              // 标记所有研究步骤为完成
-              setResearchSteps(prev => prev.map(s => ({ ...s, status: 'completed' as const })))
+              // Completion closes the run; it must not erase failed or unexecuted stages.
+              setResearchSteps(prev => prev.map(s => ({ ...s, status: restoredStepStatus(s, { status: 'completed', state_json: json }),
+                subtitle: s.type === 'reviewing' ? (reviewPresentation(json).passed ? '审核通过' : '执行结束，仍需核对审核问题') : s.subtitle })))
               // 确保触发重新计算
               console.log(`[前端] research_complete: ✅ 研究完成，强制触发 researchDataVersion 更新`)
               setResearchDataVersion(v => v + 1)
@@ -997,10 +1054,11 @@ export default function Index() {
                 target.reactSteps = []
               }
               const content = json.content || json
+              if (typeof content.content === 'string') target.content = content.content
               target.reactSteps.push({
                 step: target.reactSteps.length + 1,
                 type: 'observation',
-                content: `📝 修订完成，共 ${content.changes_count || 0} 处修改`,
+                content: revisionPresentation(content.changes_count),
                 timestamp: Date.now(),
               })
             } else if (json.type === 'error') {
@@ -1014,6 +1072,8 @@ export default function Index() {
                 content: `❌ 错误: ${extractContent(json.content)}`,
                 timestamp: Date.now(),
               })
+              setResearchSteps(previous => previous.map(step => step.status === 'running'
+                ? { ...step, status: 'failed' as const, subtitle: '阶段失败，请查看错误与检查点状态' } : step))
             } else if (json.type === 'research_cancelled') {
               // 研究被取消事件
               console.log('[前端] 收到 research_cancelled 事件')
@@ -1030,8 +1090,8 @@ export default function Index() {
               if (!target.content) {
                 target.content = '⏹️ 研究已被用户取消'
               }
-              // 标记所有研究步骤为完成
-              setResearchSteps(prev => prev.map(s => ({ ...s, status: 'completed' as const })))
+              setResearchSteps(prev => prev.map(s => s.status === 'running'
+                ? { ...s, status: 'paused' as const, subtitle: json.checkpoint_saved ? '已暂停并保存检查点' : '已暂停，检查点状态待确认' } : s))
             } else if (json.type === 'chart') {
               // 解包 content（后端将数据包在 content 里）
               const content = json.content || json
@@ -1177,71 +1237,94 @@ export default function Index() {
 
   const send = useCallback(
     async (message: string, attachmentIds?: string[]) => {
-      if (loadingRef.current) return
+      if (loadingRef.current || stoppingRef.current || sendPendingRef.current !== null || resumeLock.current || !id) return
       if (!message && (!attachmentIds || attachmentIds.length === 0)) return
-      if (!profileLoadedRef.current) await loadCheckpointRef.current()
-      if (!profileLoadedRef.current) {
-        uiMessage.error('研究模式加载失败，请刷新后重试')
-        return
-      }
-      if ((restoredCheckpointRef.current || initialProfile) && deviceState.searchModes.length === 0) {
-        // Keep research-mode requests on the six-agent path. Removing all
-        // sources must not silently turn a study into an ordinary chat.
-        uiMessage.warning('请至少选择网络搜索或本地知识库后开始调研')
-        return
-      }
-
-      chat.list.push({
-        id: createChatId(),
-        role: ChatRole.User,
-        type: ChatType.Normal,
-        content: message || '(附件问答)',
-      })
-
-      chat.list.push({
-        id: createChatId(),
-        role: ChatRole.Assistant,
-        type: (deviceState.searchModes as string[]).length > 0 ? ChatType.Deepsearch : ChatType.Normal,
-        content: '',
-      })
-      scrollToBottom()
-
-      // 保存用户消息到数据库
-      if (id) {
-        try {
-          await api.session.addMessage(id, {
-            role: 'user',
-            content: message || '(附件问答)',
-          })
-        } catch (e) {
-          console.error('Failed to save user message:', e)
+      const sendSession = id
+      const sendGeneration = ++operationGenerationRef.current
+      sendPendingRef.current = sendGeneration
+      const isCurrentSend = () => activeSessionRef.current === sendSession && operationGenerationRef.current === sendGeneration
+      try {
+        if (!profileLoadedRef.current) await loadCheckpointRef.current()
+        if (!isCurrentSend()) return
+        if (!profileLoadedRef.current) {
+          uiMessage.error('研究模式加载失败，请刷新后重试')
+          return
         }
-      }
-
-      const target = chat.list[chat.list.length - 1]
-
-      await sendChat(target, message || '请分析附件内容', attachmentIds)
-
-      // 保存助手回复到数据库
-      if (id && target.content) {
-        try {
-          await api.session.addMessage(id, {
-            role: 'assistant',
-            content: target.content,
-            thinking: target.think,
-            references_data: { references: target.reference || [], science_data: target.scienceData, charts: target.charts },
+        if ((deviceState.searchModes as string[]).length > 0 && (checkpointInfo || restoredCheckpointRef.current)) {
+          Modal.confirm({
+            title: '本会话已有研究，不能覆盖原检查点',
+            content: '新问题请新建独立研究；要补充或修订当前报告，请使用工具栏的“继续研究”或“追加复核”。原报告、证据与预算将保留。',
+            okText: '新建研究', cancelText: '保留当前研究',
+            onOk: () => navigate(`/chat?mode=${researchProfileRef.current || 'science'}&prompt=${encodeURIComponent(message)}`),
           })
-        } catch (e) {
-          console.error('Failed to save assistant message:', e)
+          return
         }
-      }
+        if ((restoredCheckpointRef.current || initialProfile) && deviceState.searchModes.length === 0) {
+          // Keep research-mode requests on the six-agent path. Removing all
+          // sources must not silently turn a study into an ordinary chat.
+          uiMessage.warning('请至少选择网络搜索或本地知识库后开始调研')
+          return
+        }
 
-      // 发送后清空附件列表
-      if (attachmentIds && attachmentIds.length > 0) {
-        setAttachments([])
+        chat.list.push({
+          id: createChatId(),
+          role: ChatRole.User,
+          type: ChatType.Normal,
+          content: message || '(附件问答)',
+        })
+
+        chat.list.push({
+          id: createChatId(),
+          role: ChatRole.Assistant,
+          type: (deviceState.searchModes as string[]).length > 0 ? ChatType.Deepsearch : ChatType.Normal,
+          content: '',
+        })
+        scrollToBottom()
+        const target = chat.list[chat.list.length - 1]
+        target.loading = true
+
+        // 保存用户消息到数据库
+        if (id) {
+          try {
+            await api.session.addMessage(id, {
+              role: 'user',
+              content: message || '(附件问答)',
+            })
+          } catch (e) {
+            console.error('Failed to save user message:', e)
+          }
+        }
+        if (!isCurrentSend()) {
+          target.loading = false
+          return
+        }
+
+        await sendChat(target, message || '请分析附件内容', attachmentIds)
+        if (!isCurrentSend()) return
+
+        // 保存助手回复到数据库
+        if (id && target.content) {
+          try {
+            await api.session.addMessage(id, {
+              role: 'assistant',
+              content: target.content,
+              thinking: target.think,
+              references_data: { references: target.reference || [], science_data: target.scienceData, charts: target.charts },
+            })
+          } catch (e) {
+            console.error('Failed to save assistant message:', e)
+          }
+        }
+
+        // 发送后清空附件列表
+        if (isCurrentSend() && attachmentIds && attachmentIds.length > 0) {
+          setAttachments([])
+        }
+      } finally {
+        if (sendPendingRef.current === sendGeneration) sendPendingRef.current = null
       }
     },
-    [chat, sendChat, id, checkpointInfo, initialProfile],
+    [chat, sendChat, id, checkpointInfo, initialProfile, navigate],
   )
   const hasSentInitialMessage = useRef(false)
   // The transport hook retains its initial value while this route component is
@@ -1255,6 +1338,19 @@ export default function Index() {
   // 当 session ID 变化时，重置加载状态
   useEffect(() => {
     if (id !== previousIdRef.current) {
+      operationGenerationRef.current += 1
+      sendPendingRef.current = null
+      stoppingRef.current = false
+      setStopping(false)
+      streamScopeRef.current.close()
+      void readerRef.current?.cancel().catch(() => {})
+      readerRef.current = null
+      currentSessionIdRef.current = null
+      resumeLock.current = false
+      setResuming(false)
+      setReviewOpen(false)
+      setReviewNotes('')
+      setReviewClaimIds([])
       console.log('[会话切换] 从', previousIdRef.current, '切换到', id)
       previousIdRef.current = id
       hasLoadedMessages.current = false
@@ -1281,6 +1377,8 @@ export default function Index() {
   // 加载会话历史消息
   useEffect(() => {
     if (!id || hasLoadedMessages.current) return
+    const viewGeneration = viewIdentityRef.current.generation
+    const operationGeneration = operationGenerationRef.current
     // NewChat created this session for the pending request. A concurrent
     // history response must not replace its in-flight user/assistant items.
     if (ctx && ctx.data.sessionId === id && !consumedInitialSessions.current.has(ctx.data.sessionId)
@@ -1333,7 +1431,8 @@ export default function Index() {
         console.log('[加载消息] 开始加载会话消息:', id)
         const res = await api.session.getSession(id!)
         const session = (res as any).data || res
-        if (activeSessionRef.current !== id) return
+        if (activeSessionRef.current !== id || viewIdentityRef.current.generation !== viewGeneration
+          || operationGenerationRef.current !== operationGeneration) return
 
         if (session && session.messages && session.messages.length > 0) {
           hasLoadedMessages.current = true
@@ -1352,13 +1451,16 @@ export default function Index() {
   // 加载并恢复研究检查点状态
   useEffect(() => {
     if (!id || hasLoadedCheckpoint.current) return
+    const viewGeneration = viewIdentityRef.current.generation
 
     async function loadCheckpoint() {
+      const operationGeneration = operationGenerationRef.current
       try {
         console.log('[恢复状态] 开始加载检查点, session_id:', id)
         const res = await api.session.getFullResearchCheckpoint(id!)
         const response = (res as any).data || res
-        if (activeSessionRef.current !== id) return
+        if (activeSessionRef.current !== id || viewIdentityRef.current.generation !== viewGeneration
+          || operationGenerationRef.current !== operationGeneration) return
         console.log('[恢复状态] API响应:', { success: response?.success, hasCheckpoint: !!response?.checkpoint })
         if (response?.success && response?.checkpoint) {
           const checkpoint = response.checkpoint
@@ -1368,6 +1470,13 @@ export default function Index() {
           setProfileId(savedProfile)
           restoredCheckpointRef.current = checkpoint
           setCheckpointInfo(checkpoint)
+          // The generation checks above prevent late history for A from
+          // replacing the selector of B (or a newly created research session).
+          const savedSearchSelection = checkpointSearchSelection(checkpoint, id!)
+          if (savedSearchSelection) {
+            deviceActions.setKnowledgeBaseName(savedSearchSelection.knowledgeBase?.name || '')
+            deviceActions.setSearchModes(savedSearchSelection.modes)
+          }
           console.log('[恢复状态] 检查点详情:', {
             phase: checkpoint.phase,
             status: checkpoint.status,
@@ -1400,21 +1509,17 @@ export default function Index() {
                 type: (s.type === 'researching' ? 'searching' : s.type) as ResearchStep['type'],
                 title: s.title || s.type || '',
                 subtitle: s.subtitle || '',
-                status: checkpoint.status === 'completed' ? 'completed' : s.status || 'completed',
+                status: restoredStepStatus(s, checkpoint),
                 stats: s.stats,
               }))
             } else {
-              // 创建默认研究步骤（基于可用数据推断）
-              console.log('[恢复状态] 无步骤数据，创建默认步骤')
-              const defaultSteps: ResearchStep['type'][] = ['planning', 'searching', 'analyzing', 'writing']
-              if (checkpoint.phase === 'reviewing') defaultSteps.push('reviewing')
-              steps = defaultSteps.map(type => ({
-                id: type,
-                type,
-                title: type,
-                subtitle: '',
-                status: 'completed' as const,
-              }))
+              // Legacy checkpoints may lack step telemetry. Do not invent successful stages.
+              const phase = checkpoint.phase === 'researching' ? 'searching' : checkpoint.phase
+              if (['planning', 'searching', 'analyzing', 'writing', 'reviewing', 're_researching', 'revising'].includes(phase)) {
+                steps = [{ id: phase, type: phase as ResearchStep['type'], title: phase,
+                  subtitle: '历史检查点未记录完整阶段进度',
+                  status: restoredStepStatus({ type: phase, status: checkpoint.status }, checkpoint) }]
+              }
             }
 
             setResearchSteps(steps)
@@ -1547,24 +1652,35 @@ export default function Index() {
     loadCheckpoint()
   }, [id, chat, restoreAssistantFromCheckpoint])
 
-  const handleResume = async () => {
-    if (!id || loadingRef.current || resumeLock.current) return
+  const handleResume = async (options: api.session.ResumeResearchOptions = {}) => {
+    if (!id || loadingRef.current || stoppingRef.current || sendPendingRef.current !== null || resumeLock.current) return
+    const resumeSession = id
+    const resumeGeneration = ++operationGenerationRef.current
+    const isCurrentResume = () => activeSessionRef.current === resumeSession && operationGenerationRef.current === resumeGeneration
     resumeLock.current = true
     setResuming(true)
     try {
       await loadCheckpointRef.current()
-      const target: API.ChatItem = { id: createChatId(), role: ChatRole.Assistant, type: ChatType.Deepsearch, content: '' }
+      if (!isCurrentResume()) return
+      const resumeCheckpoint = restoredCheckpointRef.current
+      const target: API.ChatItem = { id: createChatId(), role: ChatRole.Assistant, type: ChatType.Deepsearch, content: '',
+        scienceData: resumeCheckpoint?.session_id === resumeSession
+          ? readScienceData(checkpointDisplayState(resumeCheckpoint)) : undefined }
       chat.list.push(target)
       const liveTarget = chat.list[chat.list.length - 1]
-      await sendChat(liveTarget, checkpointInfo?.query || '', undefined, true)
+      setReviewOpen(false)
+      await sendChat(liveTarget, checkpointInfo?.query || '', undefined, true, options)
+      if (!isCurrentResume()) return
       if (liveTarget.content) await api.session.addMessage(id, { role: 'assistant', content: liveTarget.content,
         thinking: liveTarget.think, references_data: { references: liveTarget.reference || [], science_data: liveTarget.scienceData, charts: liveTarget.charts } })
     } catch (error: any) {
-      uiMessage.error(await getRequestErrorMessage(error, '恢复研究失败，请重试'))
+      if (isCurrentResume()) uiMessage.error(await getRequestErrorMessage(error, '恢复研究失败，请重试'))
     } finally {
-      resumeLock.current = false
-      setResuming(false)
-      await refreshCheckpointInfo()
+      if (isCurrentResume()) {
+        resumeLock.current = false
+        setResuming(false)
+        await refreshCheckpointInfo()
+      }
     }
   }
 
@@ -1679,7 +1795,7 @@ export default function Index() {
     researchDetailsRef.current.forEach((detail, stepId) => {
       console.log(`[前端] 聚合步骤 ${stepId}: searchResults=${detail.searchResults?.length || 0}, charts=${detail.charts?.length || 0}, hasGraph=${!!detail.knowledgeGraph}, hasReport=${!!detail.streamingReport}, sections=${detail.sections?.length || 0}`)
 
-      for (const field of ['papers', 'evidenceLedger', 'claims', 'claimVerification', 'evidenceAssessment', 'hypotheses'] as const) {
+      for (const field of ['papers', 'evidenceLedger', 'claims', 'claimVerification', 'evidenceAssessment', 'hypotheses', 'outcome', 'reviewVerdict', 'stopReason'] as const) {
         if (detail[field] !== undefined) scienceData = { ...scienceData, [field]: detail[field] }
       }
       // 收集搜索结果
@@ -1728,12 +1844,12 @@ export default function Index() {
     // 新版: 深度研究模式，显示研究详情面板
     if (isDeepResearchMode) {
       return (
-        <ResearchDetail
+        <ClaimEvidenceBoundary data={aggregatedResearchData}><ResearchDetail
           data={aggregatedResearchData}
           steps={researchSteps}
           onStepClick={handleResearchStepClick}
           onClose={() => setSelectedResearchDetail(null)}
-        />
+        /></ClaimEvidenceBoundary>
       )
     }
     // 旧版: 如果当前在深度搜索模式且有步骤详情，显示旧的步骤详情面板
@@ -1751,12 +1867,23 @@ export default function Index() {
     return null
   }, [currentChatItem, selectedStepDetail, isDeepResearchMode, aggregatedResearchData, researchSteps, handleResearchStepClick])
 
+  const checkpointState = checkpointInfo?.state_json || {}
+  const reviewClaims = (Array.isArray(checkpointState.claims) ? checkpointState.claims : aggregatedResearchData?.claims || []) as Claim[]
+  const extraAvailable = Math.max(0, 2 - Number(checkpointState.review_extension_rounds || 0))
+  const remainingReviewBudget = Math.max(0, Number(checkpointState.max_iterations || 0) - Number(checkpointState.iteration || 0))
+  const mayUseRemaining = Number(checkpointState.review_extension_rounds || 0) > 0 && remainingReviewBudget > 0
+  const openReview = () => {
+    setAdditionalIterations(Math.max(1, Math.min(extraAvailable, 1)))
+    setUseRemainingBudget(extraAvailable === 0 && mayUseRemaining)
+    setReviewOpen(true)
+  }
+
   return (
     <ComPageLayout
       sender={
         <>
           <ComSender
-            loading={loading}
+            loading={loading || stopping}
             requireSearch={!!checkpointInfo || !!initialProfile}
             placeholder={profileId === 'industry' ? '继续提问行业、企业或风险问题；Enter 开始，Shift + Enter 换行' : '继续描述研究问题；Enter 开始，Shift + Enter 换行'}
             attachments={attachments}
@@ -1773,10 +1900,35 @@ export default function Index() {
       <div className={styles['chat-page']}>
         <Space wrap className={styles['chat-toolbar']}>
           {profileId && (checkpointInfo || initialProfile) && <Tag color={profileId === 'industry' ? 'cyan' : 'blue'}>{RESEARCH_PROFILE_LABELS[profileId]}</Tag>}
-          {checkpointInfo && <Tag>研究：{({ running: '运行中', paused: '已暂停', failed: '失败可恢复', completed: '已完成' })[checkpointInfo.status]}</Tag>}
-          {checkpointInfo && checkpointInfo.status !== 'completed' && <Button loading={resuming} disabled={loading} onClick={handleResume}>继续研究</Button>}
+          {checkpointInfo && <Tag>执行：{({ running: '运行中', paused: '已暂停', failed: '失败（检查点可用时恢复）', completed: '已结束' })[checkpointInfo.status]}</Tag>}
+          {checkpointInfo?.status === 'completed' && <Tag color={reviewPresentation(checkpointState).passed ? 'green' : 'orange'}>{reviewPresentation(checkpointState).passed ? '质量审核通过' : '请核对审核结论与资料限制'}</Tag>}
+          {checkpointInfo && checkpointInfo.status !== 'completed' && <Button loading={resuming} disabled={loading || stopping} onClick={() => handleResume()}>继续研究</Button>}
+          {checkpointInfo?.status === 'completed' && profileId !== 'industry' && <Button loading={resuming} disabled={loading || stopping} onClick={openReview}>追加复核</Button>}
+          {checkpointInfo && <Button disabled={loading || stopping} onClick={() => navigate(`/chat?mode=${profileId || 'science'}`)}>新建研究</Button>}
           <Button loading={savingMemory} disabled={loading || list.length === 0} onClick={handleSaveMemory}>保存为记忆</Button>
         </Space>
+        <Modal title="追加有限复核（保留原报告版本）" open={reviewOpen} onCancel={() => setReviewOpen(false)}
+          confirmLoading={resuming} okText="确认预算并开始" okButtonProps={{ disabled: !useRemainingBudget && extraAvailable === 0 }}
+          onOk={() => {
+            if ((useRemainingBudget || reviewClaimIds.length > 0) && !reviewNotes.trim()) {
+              uiMessage.warning('使用剩余预算或指定声明时，请填写具体复核意见'); return
+            }
+            void handleResume({
+              ...(useRemainingBudget ? { use_remaining_budget: true } : { additional_iterations: Math.min(extraAvailable, additionalIterations) }),
+              ...(reviewNotes.trim() ? { review_notes: reviewNotes.trim() } : {}),
+              ...(reviewClaimIds.length ? { review_claim_ids: reviewClaimIds } : {}),
+            })
+          }}>
+          <Alert type="info" showIcon message="追加轮次不会重置总检索预算，也不保证资料一定可得。"
+            description={`累计最多追加 2 轮；本任务还可新增 ${extraAvailable} 轮。已授权剩余修订轮次 ${remainingReviewBudget}。`} />
+          <p>复核意见（指出需要核实的证据、矛盾或结论，不将意见直接作为文献证据）</p>
+          <Input.TextArea value={reviewNotes} onChange={event => setReviewNotes(event.target.value)} rows={4} maxLength={4000} showCount />
+          <p>指定声明（可选，最多 20 条；不选则由审核定位问题）</p>
+          <Select mode="multiple" style={{ width: '100%' }} value={reviewClaimIds} onChange={values => setReviewClaimIds(values.slice(0, 20))}
+            options={reviewClaims.map(claim => ({ value: claim.claim_id, label: claim.claim_text.slice(0, 110) }))} />
+          <p><Checkbox checked={useRemainingBudget} disabled={!mayUseRemaining} onChange={event => setUseRemainingBudget(event.target.checked)}>使用尚未用完的已授权追加预算</Checkbox></p>
+          {!useRemainingBudget && <Space>本次新增修订轮次<InputNumber min={1} max={Math.max(1, extraAvailable)} value={additionalIterations} disabled={extraAvailable === 0} onChange={value => setAdditionalIterations(value || 1)} /></Space>}
+        </Modal>
         <ChatMessage list={list} researchSession={!!checkpointInfo} onSend={send} onStepClick={handleStepClick} />
       </div>
     </ComPageLayout>

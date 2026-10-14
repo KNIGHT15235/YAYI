@@ -118,8 +118,10 @@ class EvidenceTests(unittest.TestCase):
     def test_explicit_topic_and_quantitative_requirements_still_trigger_gaps(self):
         query = "比较光学遥感变化检测在LEVIR数据集的F1性能排名。"
         critical, _, queries = classify_research_gaps({"critical_gaps": [
-            {"kind": "required_comparison", "description": "缺少相同划分的F1数值", "user_requirement_quote": "F1性能排名"},
-            {"kind": "topic_coverage", "description": "没有光学遥感资料", "user_requirement_quote": "光学遥感变化检测"},
+            {"kind": "required_comparison", "description": "缺少相同划分的F1数值", "user_requirement_quote": "F1性能排名",
+             "search_queries": ["LEVIR change detection F1 benchmark"]},
+            {"kind": "topic_coverage", "description": "没有光学遥感资料", "user_requirement_quote": "光学遥感变化检测",
+             "search_queries": ["optical remote sensing change detection"]},
             {"kind": "topic_coverage", "description": "用户未要求的医学证据", "user_requirement_quote": "医学研究"},
         ]}, query)
         self.assertEqual(len(critical), 2)
@@ -252,7 +254,7 @@ class BoundedRecheckTests(unittest.TestCase):
 
 
 class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_manual_review_uses_model_revision_and_rechecks_hypothesis_reason(self):
+    async def test_global_manual_review_uses_model_revision_and_rechecks_hypothesis_reason(self):
         state = fixture_state(1)
         add_papers(state, 1)
         eid = state["papers"][0]["evidence_id"]
@@ -262,9 +264,8 @@ class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
         claims[2]["verification_status"] = "insufficient"
         state.update(claims=claims, science_sections=[{"id": "sec_1", "title": "方法"}],
                      hypotheses=[{"id": "hyp_1", "content": "比较不同路线", "status": "supported", "reason": "待纠正的谱系外推", "evidence_ids": [eid]}],
-                     manual_review_request={"notes": "核对谱系、年份与作者限定", "claim_ids": [claims[0]["claim_id"]], "applied": False})
-        unchanged = copy.deepcopy(claims[1])
-        responses = [{"revisions": [{"claim_id": claims[i]["claim_id"], "text": "模型基于证据修订" + str(i), "evidence_ids": [eid]} for i in (0, 2)]},
+                     manual_review_request={"notes": "全局核对谱系、年份与作者限定，包括假设理由", "claim_ids": [], "applied": False})
+        responses = [{"revisions": [{"claim_id": claims[i]["claim_id"], "text": "模型基于证据修订" + str(i), "evidence_ids": [eid]} for i in range(3)]},
                      {"hypotheses": [{"id": "hyp_1", "status": "insufficient", "reason": "来源未支持该谱系关系", "evidence_ids": [eid],
                                        "evidence_checks": [{"evidence_id": eid, "year": 2020, "method": "siamese network", "relation": "contradicts"}]}]}]
         with patch("service.deep_research_v2.science_roles.json_call", new_callable=AsyncMock, side_effect=responses) as call:
@@ -272,11 +273,12 @@ class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.await_count, 2)
         self.assertIn("人工复核意见", call.call_args_list[0].args[1])
         self.assertIn("原有reason是待复核草稿", call.call_args_list[1].args[1])
-        self.assertEqual(state["claims"][1], unchanged)
+        self.assertEqual(state["claims"][1]["claim_text"], "模型基于证据修订1")
         self.assertEqual(state["claims"][0]["claim_text"], "模型基于证据修订0")
         self.assertEqual(state["claims"][0]["verification_status"], "pending")
         self.assertEqual(state["hypotheses"][0]["reason"], "来源未支持该谱系关系")
         self.assertTrue(state["manual_review_request"]["applied"])
+        self.assertEqual(state["manual_review_request"]["hypothesis_review_status"], "confirmed")
         self.assertEqual(state["phase"], "reviewing")
 
     async def test_hypothesis_wrong_year_or_background_support_is_not_confirmed(self):
@@ -437,19 +439,20 @@ class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshots[-1]["_next_step"], "reviewing")
         self.assertEqual(snapshots[-1]["claims"][0]["claim_id"], "partial")
         self.assertEqual(snapshots[-1]["final_report"], "Preserved research report")
-        statuses = [c.args[1] for c in graph.checkpoint_service.update_status.call_args_list]
-        self.assertEqual(statuses[-1], "paused")
-        self.assertNotIn("failed", statuses)
+        self.assertEqual(snapshots[-1]["_checkpoint_status"], "paused")
+        graph.checkpoint_service.update_status.assert_not_called()
 
-    async def test_analysis_records_gap_without_authorizing_supplement(self):
+    async def test_analysis_records_gap_and_authorizes_bounded_supplement(self):
         state = fixture_state(3)
         add_papers(state, 1)
-        await analyze_science(agent(), state)
-        self.assertEqual(state["phase"], "analyzing")
+        with patch("service.deep_research_v2.science_roles.json_call", new_callable=AsyncMock,
+                   return_value={"critical_gaps": [], "limitations": []}):
+            await analyze_science(agent(), state)
+        self.assertEqual(state["phase"], "re_researching")
         self.assertFalse(state["evidence_assessment"]["sufficient"])
         self.assertTrue(state["evidence_assessment"]["missing_questions"])
-        self.assertEqual(state["analysis_search_round"], 0)
-        self.assertFalse(state.get("pending_search_queries"))
+        self.assertEqual(state["analysis_search_round"], 1)
+        self.assertTrue(state.get("pending_search_queries"))
         self.assertEqual(state["charts"], [])
 
     async def test_chart_rerun_is_idempotent(self):

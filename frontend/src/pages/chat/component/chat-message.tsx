@@ -5,6 +5,7 @@ import classNames from 'classnames'
 import styles from './chat-message.module.scss'
 import { Result } from './result'
 import { researchMessageVersions } from '@/utils/research-message-versions'
+import ClaimEvidenceBoundary from '@/components/claim-evidence-boundary'
 
 function UserMessage(props: { item: API.ChatItem }) {
   const { item } = props
@@ -32,7 +33,9 @@ function AssistantMessage(props: {
         styles['chat-message-item--assistant'],
       )}
     >
-      <Result item={item} isEnd={isEnd} onSend={onSend} onStepClick={onStepClick} />
+      <ClaimEvidenceBoundary data={item.scienceData}>
+        <Result item={item} isEnd={isEnd} onSend={onSend} onStepClick={onStepClick} />
+      </ClaimEvidenceBoundary>
 
       {item.loading ? <ComSpinner /> : null}
     </div>

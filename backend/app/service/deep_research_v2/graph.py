@@ -1,11 +1,11 @@
 
 """
-DeepResearch V2.0 - LangGraph 工作流
+DeepResearch V2.0 - 可恢复的 asyncio 科研状态机
 
 实现多智能体协作的状态机图：
 Plan -> Research -> Analyze -> Write -> Review -> (Revise) -> Complete
 
-使用 LangGraph 实现循环和条件分支。
+线上入口使用 asyncio 状态机和节点内事件队列；保留 LangGraph 定义供历史兼容参考。
 """
 
 import logging
@@ -53,19 +53,51 @@ except ImportError:
 
 # 导入配置
 try:
-    from config.llm_config import get_config
+    from config.llm_config import get_config, resolve_agent_model
 except ImportError:
     try:
-        from app.config.llm_config import get_config
+        from app.config.llm_config import get_config, resolve_agent_model
     except ImportError:
         # 兼容直接运行脚本的情况
         import sys
         import os
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-        from config.llm_config import get_config
+        from config.llm_config import get_config, resolve_agent_model
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("DeepResearchGraph")
+
+
+class CheckpointPersistenceError(RuntimeError):
+    """A transition is not durable, so no downstream phase may start."""
+
+
+class ResearchEventQueue(asyncio.Queue):
+    """Bound UI traffic; only explicitly disposable progress may be removed.
+
+    Critical overflow stops the producer rather than silently losing a result.
+    Evidence/report state is persisted by the failure path and can be resumed.
+    """
+    progress_types = frozenset({"heartbeat", "thought", "thinking", "progress", "literature_progress"})
+
+    def __init__(self, maxsize=256):
+        super().__init__(maxsize=maxsize)
+        self.dropped_progress = 0
+        self.critical_overflow = False
+
+    def put_nowait(self, item):
+        if self.full():
+            if item.get("type") in self.progress_types:
+                self.dropped_progress += 1
+                return
+            expendable = next((event for event in self._queue if event.get("type") in self.progress_types), None)
+            if expendable is None:
+                self.critical_overflow = True
+                raise asyncio.QueueFull("critical research event buffer exhausted")
+            self._queue.remove(expendable)
+            self._unfinished_tasks -= 1
+            self.dropped_progress += 1
+        super().put_nowait(item)
 
 
 class DeepResearchGraph:
@@ -135,12 +167,12 @@ class DeepResearchGraph:
         self._apply_profile_models(self.research_profile)
 
         logger.info(f"DeepResearchGraph initialized with models:")
-        logger.info(f"  - Architect: {config.agents.architect.model}")
-        logger.info(f"  - Scout: {config.agents.scout.model}")
-        logger.info(f"  - DataAnalyst: {config.agents.data_analyst.model}")
-        logger.info(f"  - Wizard: {config.agents.wizard.model}")
-        logger.info(f"  - Critic: {config.agents.critic.model}")
-        logger.info(f"  - Writer: {config.agents.writer.model}")
+        logger.info(f"  - Architect: {self.architect.model}")
+        logger.info(f"  - Scout: {self.scout.model}")
+        logger.info(f"  - DataAnalyst: {self.data_analyst.model}")
+        logger.info(f"  - Wizard: {self.wizard.model}")
+        logger.info(f"  - Critic: {self.critic.model}")
+        logger.info(f"  - Writer: {self.writer.model}")
 
         # 检查点服务
         self.checkpoint_service = get_checkpoint_service()
@@ -152,10 +184,16 @@ class DeepResearchGraph:
             self.graph = None
 
     def _apply_profile_models(self, profile):
+        config = get_config()
+        models = profile.setdefault("agent_models", {})
         for name in ("architect", "scout", "data_analyst", "wizard", "writer", "critic"):
-            model = profile.get("agent_models", {}).get(name)
-            if model:
-                getattr(self, name).model = model
+            saved = models.get(name)
+            model = resolve_agent_model(name, saved or config.get_agent_config(name).model)
+            if saved and saved != model:
+                logger.info("Explicit model override applied to %s: %s -> %s", name, saved, model)
+            getattr(self, name).model = model
+            # Persist the model actually used, including an explicit override on resume.
+            models[name] = model
 
     def _save_checkpoint(
         self,
@@ -172,14 +210,25 @@ class DeepResearchGraph:
             return False
 
         try:
-            checkpoint_id = self.checkpoint_service.save_checkpoint(
+            options = dict(
                 session_id=session_id,
                 state=state,
                 user_id=user_id,
                 ui_state=ui_state,
                 final_report=state.get("final_report")
             )
+            status = state.get("_checkpoint_status", "running")
+            error = state.get("_checkpoint_error")
+            atomic_status = getattr(self.checkpoint_service, "supports_atomic_status", False) is True
+            if atomic_status:
+                options.update(status=status, error_message=error)
+            checkpoint_id = self.checkpoint_service.save_checkpoint(**options)
             if checkpoint_id:
+                # Compatibility for old in-memory adapters; production writes
+                # snapshot + status in the same PostgreSQL transaction.
+                if not atomic_status and status != "running":
+                    if not self.checkpoint_service.update_status(session_id, status, error, user_id=user_id):
+                        return False
                 logger.info(f"Checkpoint saved: {checkpoint_id}")
                 return True
         except Exception as e:
@@ -309,7 +358,8 @@ class DeepResearchGraph:
         user_id: str = None,
         search_web: bool = True,
         search_local: bool = False,
-        kb_name: str = None
+        kb_name: str = None,
+        knowledge_base_id: str = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         执行研究流程（流式输出）
@@ -329,6 +379,10 @@ class DeepResearchGraph:
         state = None
         if resume and session_id:
             state = self._load_checkpoint(session_id, user_id=user_id)
+            if not state:
+                yield {"type": "error", "code": "checkpoint_load_failed",
+                       "content": "检查点未能读取，未重置或重新启动研究；请稍后重试。"}
+                return
             if state:
                 yield {
                     "type": "research_resumed",
@@ -346,6 +400,7 @@ class DeepResearchGraph:
             )
             state["max_iterations"] = self.max_iterations
             state["kb_name"] = kb_name
+            state["knowledge_base_id"] = knowledge_base_id
             state["research_profile"] = getattr(self, "research_profile", get_research_profile("industry"))
             state["profile_id"] = state["research_profile"]["profile_id"]
 
@@ -358,10 +413,9 @@ class DeepResearchGraph:
                 "timestamp": datetime.now().isoformat()
             }
 
-        # Retain the saved profile, except DataAnalyst follows the current model configuration.
+        # Keep saved models on resume unless an operator explicitly overrides them.
         if "research_profile" not in state:
             state["research_profile"] = get_research_profile("industry") if resume else getattr(self, "research_profile", get_research_profile("industry"))
-        state["research_profile"].setdefault("agent_models", {})["data_analyst"] = get_config().agents.data_analyst.model
         self._apply_profile_models(state["research_profile"])
         if scientific(state):
             ensure_science_state(state)
@@ -373,12 +427,8 @@ class DeepResearchGraph:
         for agent in (self.architect, self.scout, self.data_analyst, self.wizard, self.writer, self.critic):
             agent.cache_scope = str(user_id) if user_id else None
 
-        # 始终使用手写版本执行（支持实时SSE流式输出）
-        # LangGraph 版本会批量处理消息，无法实现实时流式输出
-        # if LANGGRAPH_AVAILABLE and self.graph:
-        #     async for event in self._run_with_langgraph(state):
-        #         yield event
-        # else:
+        # 当前产品选择 asyncio 执行器以集中管理节点内进度、取消与恢复。
+        # 这是本项目的实现选择，并非 LangGraph 不支持实时流式输出。
         async with aclosing(self._run_simplified(state)) as events:
             async for event in events:
                 yield event
@@ -412,16 +462,17 @@ class DeepResearchGraph:
         使用 asyncio.Queue 实现实时流式输出
         """
         # 创建消息队列用于实时输出
-        message_queue = asyncio.Queue()
+        message_queue = ResearchEventQueue()
         state["_message_queue"] = message_queue
         active_task = None
+        active_monitor = None
+        terminal_persisted = False
 
         # 获取 session_id 用于取消检查
         session_id = state.get("session_id", "")
 
-        # 清除之前的取消标志
-        if session_id:
-            clear_cancel_flag(session_id)
+        # The authenticated router clears the old flag before returning SSE.
+        # Clearing here would erase a cancellation sent after research_start.
 
         class ResearchCancelled(Exception):
             """User cancellation exits the phase before normal completion checks."""
@@ -429,14 +480,12 @@ class DeepResearchGraph:
         async def check_cancelled():
             """检查是否已取消"""
             if session_id and is_research_cancelled(session_id):
-                if self.checkpoint_service:
-                    self.checkpoint_service.update_status(session_id, "paused", user_id=state.get("_user_id"))
                 return True
             return False
 
         async def run_agent_with_streaming(agent):
             """执行 agent 并实时 yield 消息"""
-            nonlocal active_task
+            nonlocal active_task, active_monitor
             # 检查是否已取消
             if await check_cancelled():
                 logger.info(f"Research cancelled before starting agent: {agent.name}")
@@ -447,6 +496,26 @@ class DeepResearchGraph:
             # 启动 agent 处理任务
             task = asyncio.create_task(agent.process(state))
             active_task = task
+            cancelled = asyncio.Event()
+
+            async def monitor_cancellation():
+                # Runs even while the SSE generator is suspended on a slow
+                # consumer. Cancellation must not wait for another socket read.
+                while not task.done():
+                    if await check_cancelled():
+                        cancelled.set()
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        try:
+                            await save_checkpoint_async({"type": state.get("phase"), "status": "paused"},
+                                                        next_step=state.get("_next_step"), status="paused")
+                        except Exception:
+                            logger.exception("Cancellation snapshot was not persisted")
+                        return
+                    await asyncio.sleep(0.2)
+
+            cancellation_monitor = asyncio.create_task(monitor_cancellation())
+            active_monitor = cancellation_monitor
 
             msg_count = 0
             last_event = asyncio.get_running_loop().time()
@@ -460,6 +529,8 @@ class DeepResearchGraph:
                         await task
                     except asyncio.CancelledError:
                         pass
+                    cancellation_monitor.cancel()
+                    await asyncio.gather(cancellation_monitor, return_exceptions=True)
                     raise ResearchCancelled()
 
                 try:
@@ -476,12 +547,20 @@ class DeepResearchGraph:
                     continue
                 except (asyncio.CancelledError, GeneratorExit):
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    cancellation_monitor.cancel()
+                    await asyncio.gather(task, cancellation_monitor, return_exceptions=True)
                     raise
                 except Exception as e:
                     logger.warning(f"[{agent.name}] Queue error: {e}")
                     continue
 
+            cancellation_monitor.cancel()
+            await asyncio.gather(cancellation_monitor, return_exceptions=True)
+            if cancelled.is_set():
+                raise ResearchCancelled()
+            if message_queue.critical_overflow:
+                await asyncio.gather(task, return_exceptions=True)
+                raise RuntimeError("研究关键事件缓冲区已满，已停止当前阶段；请恢复研究")
             # 等待任务完成（获取可能的异常）
             try:
                 await task
@@ -496,7 +575,7 @@ class DeepResearchGraph:
                     msg = message_queue.get_nowait()
                     remaining += 1
                     yield msg
-                except:
+                except asyncio.QueueEmpty:
                     break
 
             logger.info(f"Agent {agent.name} completed. Messages: {msg_count} during, {remaining} remaining")
@@ -592,7 +671,8 @@ class DeepResearchGraph:
                        f"references={len(ui_state.get('references', []))}, "
                        f"report_len={len(ui_state.get('streaming_report', ''))}")
 
-        async def save_checkpoint_async(step_info: dict = None, next_step: str = None):
+        async def save_checkpoint_async(step_info: dict = None, next_step: str = None,
+                                        status: str = "running", error_message: str = None):
             """异步保存检查点"""
             if next_step:
                 state["_next_step"] = next_step
@@ -616,12 +696,12 @@ class DeepResearchGraph:
             logger.info(f"[检查点保存] session_id={session_id}, phase={state.get('phase', '')}, "
                        f"steps={[s.get('type') for s in ui_state['research_steps']]}")
 
+            state["_checkpoint_status"] = status
+            state["_checkpoint_error"] = error_message
             if self._save_checkpoint(state, user_id, ui_state):
                 logger.info(f"[检查点保存成功] session_id={session_id}")
                 return {"type": "checkpoint_saved", "phase": state.get("phase", ""), "session_id": session_id}
-            else:
-                logger.error(f"[检查点保存失败] session_id={session_id}")
-            return None
+            raise CheckpointPersistenceError("检查点持久化失败；研究已停止，当前阶段未确认保存。只能从最后成功的检查点恢复。")
 
         try:
             if scientific(state):
@@ -654,9 +734,9 @@ class DeepResearchGraph:
                 elif step == "analyzing":
                     async for msg in run_agent_with_streaming(self.data_analyst):
                         yield msg
-                    if scientific(state) and state.get("phase") == "reviewing":
-                        next_step = "reviewing"
-                    elif not scientific(state) and state.get("phase") == "re_researching":
+                    if scientific(state) and state.get("phase") in {"reviewing", "completed"}:
+                        next_step = state["phase"]
+                    elif state.get("phase") == "re_researching":
                         next_step = "re_researching"
                     else:
                         async for msg in run_agent_with_streaming(self.wizard):
@@ -666,19 +746,22 @@ class DeepResearchGraph:
                     async for msg in run_agent_with_streaming(self.writer):
                         yield msg
                     next_step = "reviewing"
-                elif next_step == "reviewing":
+                elif next_step in {"reviewing", "review_retry"}:
+                    prior_retry = state.get("review_retry_count", 0)
                     async for msg in run_agent_with_streaming(self.critic):
                         yield msg
                     next_step = state["phase"]
                     if next_step == "reviewing":
                         raise RuntimeError("审核未返回有效结论，研究未完成")
+                    if step == "review_retry" and next_step == "review_retry" and state.get("review_retry_count", 0) <= prior_retry:
+                        raise RuntimeError("审核重试未消耗有限预算，已停止无进展循环")
                 elif next_step == "re_researching":
                     async for msg in run_agent_with_streaming(self.scout):
                         yield msg
                     # Every scientific supplement re-evaluates hypotheses and coverage
                     # before updating figures and revising the existing claims.
                     if scientific(state):
-                        state["analysis_continuation"] = "revising" if state.get("claims") else "writing"
+                        state.setdefault("analysis_continuation", "revising" if state.get("claims") else "writing")
                         next_step = "analyzing"
                     else:
                         next_step = state.get("return_phase") or "revising"
@@ -695,8 +778,16 @@ class DeepResearchGraph:
                 if await check_cancelled():
                     raise ResearchCancelled()
                 state["messages"] = []
+                # A graceful workflow stop can still mean this node failed.
+                # Preserve that distinction in the durable timeline instead of
+                # turning a provider/schema failure into a green completed step.
+                phase_unavailable = next_step == "completed" and (
+                    (step == "analyzing" and state.get("stop_reason") == "analysis_unavailable")
+                    or (step in {"reviewing", "review_retry"} and state.get("stop_reason") == "review_unavailable")
+                )
                 step_info = {
-                    "type": step, "status": "completed",
+                    "type": step, "status": "failed" if phase_unavailable else "completed",
+                    "subtitle": state.get("quality_review_note", "") if phase_unavailable else "",
                     "stats": {"sections": len(state.get("outline", [])), "facts": len(state.get("facts", [])),
                               "charts": len(state.get("charts", [])), "report_length": len(state.get("final_report", ""))}
                 } if scientific(state) or step in {"planning", "researching", "analyzing", "writing"} else None
@@ -717,9 +808,8 @@ class DeepResearchGraph:
             state["phase"] = ResearchPhase.COMPLETED.value
             if not state.get("final_report", "").strip():
                 raise RuntimeError("研究未生成报告，不能标记为完成")
-            await save_checkpoint_async(next_step="completed")
-            if self.checkpoint_service and session_id:
-                self.checkpoint_service.update_status(session_id, "completed", user_id=user_id)
+            await save_checkpoint_async(next_step="completed", status="completed")
+            terminal_persisted = True
 
             # 构建前端友好的 references
             final_facts = state.get("facts", [])
@@ -744,6 +834,11 @@ class DeepResearchGraph:
 
             yield {
                 "type": "research_complete",
+                "outcome": state.get("outcome", "completed_with_warnings"),
+                "research_outcome": state.get("outcome", "completed_with_warnings"),
+                "review_verdict": state.get("review_verdict", "unconfirmed"),
+                "stop_reason": state.get("stop_reason", "legacy_completion"),
+                "dropped_progress_events": message_queue.dropped_progress,
                 "final_report": state.get("final_report", ""),
                 "quality_score": state.get("quality_score", 0.0),
                 "facts_count": len(state.get("facts", [])),
@@ -765,25 +860,37 @@ class DeepResearchGraph:
                 "quality_review_note": state.get("quality_review_note", "")
             }
 
+        except CheckpointPersistenceError as error:
+            yield {"type": "error", "code": "checkpoint_persistence_failed", "content": str(error),
+                   "recoverable": False, "last_checkpoint_only": True, "checkpoint_saved": False}
         except ResearchCancelled:
             # Keep partial results and rerun this unfinished phase on resume.
             # In particular, a cancelled Critic has no verdict by design; it
             # must never fall through to the "missing review" failure path.
-            await save_checkpoint_async({"type": state.get("phase"), "status": "paused"},
-                                        next_step=state.get("_next_step") or state.get("phase"))
-            if self.checkpoint_service and session_id:
-                self.checkpoint_service.update_status(session_id, "paused", user_id=user_id)
-            yield {"type": "research_cancelled", "message": "研究已取消，已保存检查点", "session_id": session_id}
+            try:
+                await save_checkpoint_async({"type": state.get("phase"), "status": "paused"},
+                                            next_step=state.get("_next_step") or state.get("phase"), status="paused")
+            except CheckpointPersistenceError as error:
+                yield {"type": "error", "code": "checkpoint_persistence_failed", "content": str(error),
+                       "recoverable": False, "last_checkpoint_only": True, "checkpoint_saved": False}
+            else:
+                yield {"type": "research_cancelled", "message": "研究已取消，已保存检查点", "session_id": session_id,
+                       "checkpoint_saved": True}
         except (asyncio.CancelledError, GeneratorExit):
+            if terminal_persisted:
+                # Closing the SSE response after receiving research_complete
+                # must not downgrade a durable completion into "paused".
+                raise
             if active_task and not active_task.done():
                 active_task.cancel()
                 await asyncio.gather(active_task, return_exceptions=True)
             # Persist in-flight retrieval counters and partial verified evidence,
             # including cancellation by SSE disconnect rather than the cancel API.
-            await save_checkpoint_async({"type": state.get("phase"), "status": "paused"},
-                                        next_step=state.get("_next_step") or state.get("phase"))
-            if self.checkpoint_service and session_id:
-                self.checkpoint_service.update_status(session_id, "paused", user_id=user_id)
+            try:
+                await save_checkpoint_async({"type": state.get("phase"), "status": "paused"},
+                                            next_step=state.get("_next_step") or state.get("phase"), status="paused")
+            except Exception:
+                logger.exception("Disconnected research stopped but its latest snapshot was NOT saved")
             raise
         except Exception as e:
             logger.error(f"Simplified execution error: {e}")
@@ -791,20 +898,25 @@ class DeepResearchGraph:
             # completed phase. Resume retries its saved continuation normally.
             try:
                 await save_checkpoint_async({"type": state.get("phase"), "status": "failed"},
-                                            next_step=state.get("_next_step") or state.get("phase"))
+                                            next_step=state.get("_next_step") or state.get("phase"), status="failed", error_message=str(e))
             except Exception as checkpoint_error:
                 # A secondary display/storage failure must not hide the cause
                 # of the research failure or turn it into a completion event.
                 logger.error(f"Failed to prepare partial research snapshot: {checkpoint_error}")
-                self._save_checkpoint(state, user_id, ui_state)
-            # 更新检查点状态为失败
-            if self.checkpoint_service and session_id:
-                self.checkpoint_service.update_status(session_id, "failed", str(e), user_id=user_id)
+                state.update(_checkpoint_status="failed", _checkpoint_error=str(e))
+                if not self._save_checkpoint(state, user_id, ui_state):
+                    yield {"type": "error", "code": "checkpoint_persistence_failed", "content": str(e),
+                           "checkpoint_error": str(checkpoint_error), "checkpoint_saved": False,
+                           "recoverable": False, "last_checkpoint_only": True}
+                    return
             yield {"type": "error", "content": str(e)}
         finally:
             if active_task and not active_task.done():
                 active_task.cancel()
                 await asyncio.gather(active_task, return_exceptions=True)
+            if active_monitor:
+                active_monitor.cancel()
+                await asyncio.gather(active_monitor, return_exceptions=True)
             # 清理队列
             state["_message_queue"] = None
 

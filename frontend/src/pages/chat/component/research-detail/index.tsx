@@ -1,5 +1,5 @@
 
-import { FileTextOutlined, ShareAltOutlined, BarChartOutlined, CheckOutlined, LoadingOutlined, FileMarkdownOutlined } from '@ant-design/icons'
+import { FileTextOutlined, ShareAltOutlined, BarChartOutlined, CheckOutlined, LoadingOutlined, FileMarkdownOutlined, CloseCircleOutlined, PauseCircleOutlined } from '@ant-design/icons'
 import { useState } from 'react'
 import classNames from 'classnames'
 import SearchResults from './search-results'
@@ -70,7 +70,7 @@ export interface ResearchStep {
   type: 'planning' | 'searching' | 'analyzing' | 'generating' | 'writing' | 'reviewing' | 're_researching' | 'revising'
   title: string
   subtitle: string
-  status: 'pending' | 'running' | 'completed'
+  status: 'pending' | 'running' | 'completed' | 'paused' | 'failed'
   stats?: Record<string, number>
 }
 
@@ -161,20 +161,25 @@ export default function ResearchDetail({ data, steps = [], onStepClick }: Resear
                 [styles.active]: data?.stepId === step.id,
                 [styles.completed]: step.status === 'completed',
                 [styles.running]: step.status === 'running',
-                [styles.clickable]: step.status === 'completed',
+                [styles.clickable]: ['completed', 'failed', 'paused'].includes(step.status),
               })}
-              onClick={() => step.status === 'completed' && onStepClick?.(step.id)}
+              title={step.subtitle}
+              onClick={() => ['completed', 'failed', 'paused'].includes(step.status) && onStepClick?.(step.id)}
             >
               <div className={styles.stepIcon}>
                 {step.status === 'completed' ? (
                   <CheckOutlined />
                 ) : step.status === 'running' ? (
                   <LoadingOutlined spin />
+                ) : step.status === 'failed' ? (
+                  <CloseCircleOutlined style={{ color: '#cf1322' }} />
+                ) : step.status === 'paused' ? (
+                  <PauseCircleOutlined style={{ color: '#ad6800' }} />
                 ) : (
                   <span>{index + 1}</span>
                 )}
               </div>
-              <div className={styles.stepLabel}>{stepLabels[step.type] || step.title}</div>
+              <div className={styles.stepLabel}>{stepLabels[step.type] || step.title}{step.status === 'failed' ? '（失败）' : step.status === 'paused' ? '（已暂停）' : ''}</div>
               {index < steps.length - 1 && <div className={styles.stepLine} />}
             </div>
           ))}

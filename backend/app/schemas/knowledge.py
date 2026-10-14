@@ -76,12 +76,15 @@ class DocumentAssetResponse(BaseModel):
     asset_id: str
     document_id: str
     document_version: str
+    knowledge_base_id: Optional[str] = None
     type: str
     content: Optional[str] = None
     locator: Dict[str, Any] = Field(default_factory=dict)
     media_type: Optional[str] = None
     content_hash: str
     download_url: Optional[str] = None
+    content_truncated: bool = False
+    hydration: Dict[str, Any] = Field(default_factory=dict)
 
 
 class DocumentAssetListResponse(BaseModel):

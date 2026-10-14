@@ -4,16 +4,16 @@ import os
 import hashlib
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks, Query
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from core.database import get_db
 from models.knowledge import KnowledgeBase, Document, DocumentAsset, DocumentChunkProvenance
-from service.document_assets import (persist_provenance, enrich_chunks, asset_response,
+from service.document_assets import (persist_provenance, enrich_chunks, asset_response, hydrate_asset_response,
                                      safe_asset_path, remove_asset_files)
 from models.user import User
 from router.auth_router import get_current_user_required
@@ -27,6 +27,7 @@ from schemas.knowledge import (
     DocumentUploadResponse,
     KnowledgeSearchRequest,
     DocumentAssetListResponse,
+    DocumentAssetResponse,
 )
 
 router = APIRouter(prefix="/knowledge-bases", tags=["知识库管理"])
@@ -728,7 +729,7 @@ async def search_knowledge_base(kb_id: str, request: KnowledgeSearchRequest,
         if doc is None:
             continue  # No unowned or orphan vector metadata is returned.
         available = stored_original(doc.file_path) is not None
-        rows.append({"chunk_id": chunk.get("id"), "document_id": str(doc.id),
+        rows.append({"chunk_id": chunk.get("id"), "document_id": str(doc.id), "knowledge_base_id": str(kb.id),
                      "document_name": doc.filename, "content": chunk.get("content", ""),
                      "score": chunk.get("score", 0), "rerank_score": chunk.get("rerank_score"),
                      "chunk_index": chunk.get("chunk_index", 0), "download_available": available,
@@ -754,10 +755,29 @@ def owned_document(db, current_user, kb_id, doc_id):
 
 @router.get("/{kb_id}/documents/{doc_id}/assets", response_model=DocumentAssetListResponse)
 def list_document_assets(kb_id: str, doc_id: str,
-                         current_user: User = Depends(get_current_user_required), db: Session = Depends(get_db)):
+                         current_user: User = Depends(get_current_user_required), db: Session = Depends(get_db),
+                         document_version: Optional[str] = None):
     kb, document = owned_document(db, current_user, kb_id, doc_id)
-    assets = db.query(DocumentAsset).filter_by(document_id=document.id).order_by(DocumentAsset.created_at, DocumentAsset.id).all()
+    query = db.query(DocumentAsset).filter_by(document_id=document.id)
+    if document_version is not None:
+        query = query.filter_by(document_version=document_version)
+    assets = query.order_by(DocumentAsset.created_at, DocumentAsset.id).all()
     return {"document_id": str(document.id), "assets": [asset_response(asset, kb.id) for asset in assets]}
+
+
+@router.get("/{kb_id}/documents/{doc_id}/assets/{asset_id}/evidence", response_model=DocumentAssetResponse)
+def get_document_asset_evidence(kb_id: str, doc_id: str, asset_id: str,
+                               document_version: str = Query(..., min_length=1, max_length=64),
+                               query: str = Query("", max_length=2000),
+                               max_chars: int = Query(5000, ge=0, le=20000),
+                               current_user: User = Depends(get_current_user_required), db: Session = Depends(get_db)):
+    """Authorized, version-bound expansion. A caption is not image verification."""
+    kb, document = owned_document(db, current_user, kb_id, doc_id)
+    asset = db.query(DocumentAsset).filter_by(id=asset_id, document_id=document.id,
+                                             document_version=document_version).first()
+    if asset is None:
+        raise HTTPException(404, "该文档版本的资产不存在")
+    return hydrate_asset_response(asset, kb.id, query=query, max_chars=max_chars)
 
 
 @router.get("/{kb_id}/documents/{doc_id}/assets/{asset_id}/download")

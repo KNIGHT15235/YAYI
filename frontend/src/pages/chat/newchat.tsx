@@ -195,7 +195,7 @@ export default function NewChat() {
     if (!sessionId) {
       try {
         // 使用新的 session API，这样会话会出现在对话历史中
-        const { data } = await api.session.createSession({ title: '新对话' })
+        const { data } = await api.session.createSession({ title: '新研究', session_type: 'deepsearch' })
         sessionId = data.id
         setPendingSessionId(sessionId)
       } catch (e) {
@@ -266,7 +266,7 @@ export default function NewChat() {
       // 使用新的 session API，这样会话会出现在对话历史中
       // 用问题的前20个字符作为标题
       const title = msg.length > 20 ? msg.slice(0, 20) + '...' : msg
-      const { data } = await api.session.createSession({ title })
+      const { data } = await api.session.createSession({ title, session_type: 'deepsearch' })
       sessionId = data.id
     } else {
       // 如果已有会话，更新标题

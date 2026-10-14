@@ -2,6 +2,15 @@ import type { DocumentLocator } from '@/api/knowledge'
 
 type LocatorRecord = Record<string, unknown>
 
+const COLLAPSED_LOCATOR_COUNT = 4
+
+/** Limit presentation only; the original locator objects remain untouched. */
+export function locatorWindow(locators: readonly DocumentLocator[] | undefined, expanded = false) {
+  const all = locators || []
+  const visible = expanded ? all : all.slice(0, COLLAPSED_LOCATOR_COUNT)
+  return { visible, total: all.length, hidden: all.length - visible.length }
+}
+
 function index(value: unknown): number | undefined {
   if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return undefined
   const number = Number(value)

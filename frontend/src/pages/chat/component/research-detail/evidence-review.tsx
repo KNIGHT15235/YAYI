@@ -1,5 +1,6 @@
 import { Alert, Collapse, Empty, Space, Tag } from 'antd'
 import type { ScienceResearchData } from '@/api/research-types'
+import LiteratureMetadata from '../literature-metadata'
 
 const labels: Record<string, string> = { supported: '支持', contradicted: '矛盾', insufficient: '证据不足', unverified: '未核验', pending: '待核验', partially_supported: '部分支持', refuted: '反驳', mixed: '混合证据' }
 const evidenceList = (value: unknown): string[] => Array.isArray(value) ? value.map(item => typeof item === 'string' ? item : JSON.stringify(item)) : []
@@ -28,7 +29,8 @@ export default function EvidenceReview({ data }: { data?: ScienceResearchData | 
       const status = result?.status || claim.verification_status || 'unverified'
       return { key: claim.claim_id, label: <span><Tag color={colors[status]}>{labels[status] || status}</Tag>{claim.claim_text}</span>, children: <div>
         <p>{result?.reason || claim.reason || '尚未给出语义核验结论。'}</p>
-        {(claim.evidence_ids || []).map(id => <div key={id} style={{ padding: '10px 0', borderTop: '1px solid #f0f0f0' }}><strong>{id} · {ledger[id]?.title || '未找到关联证据'}</strong><p style={{ whiteSpace: 'pre-wrap' }}>{ledger[id]?.content || ledger[id]?.abstract || '没有保存可供展示的原文摘录。'}</p></div>)}
+        {(claim.evidence_links || []).map((link, index) => <p key={`${link.evidence_id}-${index}`}><a href={`#claim-evidence:${encodeURIComponent(claim.claim_id)}:${index}`}>查看引用位置 {index + 1}</a> <Tag>{link.precision || 'chunk'}</Tag></p>)}
+        {(claim.evidence_ids || []).map(id => <div key={id} style={{ padding: '10px 0', borderTop: '1px solid #f0f0f0' }}><strong>{id} · {ledger[id]?.title || '未找到关联证据'}</strong>{ledger[id] && <LiteratureMetadata paper={ledger[id]} />}<p style={{ whiteSpace: 'pre-wrap' }}>{ledger[id]?.content || ledger[id]?.abstract || '没有保存可供展示的原文摘录。'}</p></div>)}
       </div> }
     })} />
   </div>

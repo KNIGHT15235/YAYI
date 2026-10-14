@@ -17,5 +17,6 @@ export async function getRequestErrorMessage(error: unknown, fallback: string): 
     data = await new Response(data).json().catch(() => null)
   }
   const detail = (data as { detail?: unknown } | null)?.detail
+  if (detail && typeof detail === 'object' && 'message' in detail && typeof detail.message === 'string') return detail.message
   return typeof detail === 'string' ? detail : cause?.message || fallback
 }

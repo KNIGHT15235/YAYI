@@ -57,6 +57,8 @@ USER_ACTION.md
 /backend/test/
 /backend/*.png
 /data/
+/output/pdf/
+/tmp/pdfs/
 .venv-*/
 *.bak
 *.sqlite

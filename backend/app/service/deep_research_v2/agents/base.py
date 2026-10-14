@@ -267,12 +267,17 @@ class BaseAgent(ABC):
             "content": content
         }
         state["messages"].append(message)
+        # Messages are a UI tail, not the authoritative evidence/checkpoint.
+        # Bound both copies of progress during a slow/disconnected consumer.
+        del state["messages"][:-256]
 
         # 如果有消息队列，立即推送（支持实时流式输出）
         if "_message_queue" in state and state["_message_queue"] is not None:
             try:
                 state["_message_queue"].put_nowait(message)
                 self.logger.info(f"[SSE] Queued event: {event_type} (queue size: {state['_message_queue'].qsize()})")
+            except asyncio.QueueFull as e:
+                raise RuntimeError("研究关键事件缓冲区已满，已停止当前阶段；请恢复研究") from e
             except Exception as e:
                 self.logger.warning(f"Failed to push message to queue: {e}")
         else:

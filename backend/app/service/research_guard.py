@@ -49,10 +49,12 @@ class ResearchLease:
         self.client = client if client is not None else redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"), port=int(os.getenv("REDIS_PORT", "6379")),
             password=os.getenv("REDIS_PASSWORD") or None, decode_responses=True,
+            db=int(os.getenv("REDIS_DB", "0")),
             socket_connect_timeout=.3, socket_timeout=.3)
         self.keys = [f"research:active:user:{user_id}", f"research:active:session:{session_id}",
                      f"research:starts:{user_id}"]
         self.token = uuid.uuid4().hex
+        self.session_id = session_id
 
     async def acquire(self, count_start=True):
         try:
@@ -96,7 +98,8 @@ class ResearchLease:
         except (asyncio.CancelledError, GeneratorExit):
             raise
         except Exception:
-            yield "data: " + json.dumps({"type": "error", "content": "研究执行或运行许可中断，请从检查点恢复"}, ensure_ascii=False) + "\n\n"
+            yield "data: " + json.dumps({"type": "error", "content": "研究执行或运行许可中断，请从检查点恢复",
+                                         "run_id": self.session_id, "session_id": self.session_id}, ensure_ascii=False) + "\n\n"
         finally:
             tasks = [renewal] + ([pending] if pending else [])
             for task in tasks:

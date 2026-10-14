@@ -20,6 +20,19 @@ export interface Paper {
   assets?: DocumentAsset[]
   document_id?: string
   knowledge_base_id?: string
+  document_version?: number | string
+  chunk_id?: string
+  asset_ids?: string[]
+}
+
+export interface ClaimEvidenceLink {
+  evidence_id: string
+  asset_id?: string
+  locator?: DocumentLocator
+  quote?: string
+  text_span?: [number, number] | { start: number; end: number }
+  precision?: string
+  document_version?: number | string
 }
 
 export interface Claim {
@@ -29,6 +42,7 @@ export interface Claim {
   evidence_ids: string[]
   verification_status?: string
   reason?: string
+  evidence_links?: ClaimEvidenceLink[]
 }
 
 export interface ClaimVerification {
@@ -44,6 +58,9 @@ export interface ClaimVerification {
 }
 
 export interface ScienceResearchData {
+  outcome?: string
+  reviewVerdict?: string
+  stopReason?: string
   papers?: Paper[]
   evidenceLedger?: Record<string, Paper>
   claims?: Claim[]
@@ -55,6 +72,9 @@ export interface ScienceResearchData {
 /** Metadata is optional, so saved research from earlier versions remains readable. */
 export function readScienceData(data: Record<string, any> = {}): ScienceResearchData {
   return {
+    outcome: data.outcome || data.research_outcome,
+    reviewVerdict: data.review_verdict,
+    stopReason: data.stop_reason,
     papers: data.papers,
     evidenceLedger: data.evidence_ledger,
     claims: data.claims,
@@ -62,6 +82,37 @@ export function readScienceData(data: Record<string, any> = {}): ScienceResearch
     evidenceAssessment: data.evidence_assessment,
     hypotheses: data.hypotheses,
   }
+}
+
+/** Stream payloads are partial; replace supplied arrays, never erase an absent ledger. */
+export function mergeScienceData(previous: ScienceResearchData | undefined, payload: Record<string, any>): ScienceResearchData {
+  const patch = Object.fromEntries(Object.entries(readScienceData(payload)).filter(([, value]) => value !== undefined))
+  return { ...previous, ...patch }
+}
+
+/** Legacy source links lack a claim locator: allow only exact, unambiguous saved identities. */
+export function resolveLocalDocumentSource(href: string, data?: ScienceResearchData | null) {
+  const match = /^\/knowledge-bases\/([0-9a-f-]{36})\/documents\/([0-9a-f-]{36})\/download$/i.exec(href)
+  if (!match) return undefined
+  const sources = Object.values(data?.evidenceLedger || {}).filter(source =>
+    source.knowledge_base_id === match[1] && source.document_id === match[2]
+    && source.document_version != null && String(source.document_version).length > 0)
+  if (!sources.length || new Set(sources.map(source => String(source.document_version))).size !== 1) return undefined
+  return sources[0]
+}
+
+/** Resolve only links belonging to the displayed report version, never another run. */
+export function resolveClaimEvidence(href: string, data?: ScienceResearchData | null) {
+  if (!href.startsWith('#claim-evidence:')) return undefined
+  const parts = href.slice('#claim-evidence:'.length).split(':')
+  if (parts.length !== 2 || !/^\d+$/.test(parts[1])) return undefined
+  try {
+    const claim = data?.claims?.find(row => row.claim_id === decodeURIComponent(parts[0]))
+    const link = claim?.evidence_links?.[Number(parts[1])]
+    const evidence = link && data?.evidenceLedger?.[link.evidence_id]
+    if (!claim || !link || !evidence || !claim.evidence_ids.includes(link.evidence_id)) return undefined
+    return { claim, link, evidence }
+  } catch { return undefined }
 }
 
 /** Prefer raw state evidence over older UI snapshots that flattened bibliographic fields. */

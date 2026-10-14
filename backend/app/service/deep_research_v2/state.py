@@ -20,6 +20,7 @@ class ResearchPhase(str, Enum):
     ANALYZING = "analyzing"          # 数据分析阶段
     WRITING = "writing"              # 撰写阶段
     REVIEWING = "reviewing"          # 对抗审核阶段
+    REVIEW_RETRY = "review_retry"    # 核验服务失败后的有界重试，不改写事实
     RE_RESEARCHING = "re_researching"  # 补充搜索阶段（审核发现缺失信息后）
     REVISING = "revising"            # 修订阶段（仅文字修改）
     COMPLETED = "completed"          # 完成
@@ -127,6 +128,22 @@ class ResearchState(TypedDict):
     literature_errors: List[Dict[str, Any]]
     science_retrieval: Dict[str, Any]        # 科研递归队列/来源线索/已访查询及持久化预算
     review_search_tasks: List[Dict[str, Any]] # Review 授权的具体缺证任务
+    research_tasks: List[Dict[str, Any]]     # Planner: section/question/query contracts
+    retrieval_evidence_links: Dict[str, Any] # Acquired evidence -> retrieval task provenance
+    section_evidence_packets: Dict[str, Any] # Analysis-approved chapter evidence packets
+    analysis_search_history: List[Dict[str, Any]]
+    analysis_decision: str                  # pending/pass/retrieve/degraded/stop
+    analysis_semantic_status: str           # not_needed/confirmed/unconfirmed
+    analysis_continuation: str              # writing/revising after analysis succeeds
+    active_retrieval_tasks: List[Dict[str, Any]]
+    review_candidate_gaps: Dict[str, Any]
+    review_repair_actions: List[Dict[str, Any]]
+    repair_analysis_history: List[str]
+    review_retry_count: int
+    outcome: str                           # Execution outcome is not a quality verdict
+    research_outcome: str                  # Backward-compatible outcome alias
+    review_verdict: str
+    stop_reason: Optional[str]
     query: str                              # 用户原始问题
     session_id: str                         # 会话ID
     phase: str                              # 当前阶段
@@ -219,6 +236,16 @@ def create_initial_state(
         quality_review_status="pending",
         quality_review_note="",
         pending_search_queries=[],
+        research_tasks=[],
+        retrieval_evidence_links={},
+        section_evidence_packets={},
+        analysis_search_history=[],
+        analysis_decision="pending",
+        review_retry_count=0,
+        outcome="pending",
+        research_outcome="pending",
+        review_verdict="not_reviewed",
+        stop_reason=None,
         logs=[],
         errors=[],
         messages=[]

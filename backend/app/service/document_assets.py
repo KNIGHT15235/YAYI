@@ -310,13 +310,93 @@ def asset_response(asset, knowledge_base_id, summary=False):
     locator = asset.locator or {}
     if summary:
         locator = {key: value for key, value in locator.items() if key != "table_rows"}
-    return {"asset_id": asset.id, "document_id": str(asset.document_id), "document_version": asset.document_version,
+    return {"asset_id": asset.id, "knowledge_base_id": str(knowledge_base_id),
+            "document_id": str(asset.document_id), "document_version": asset.document_version,
             "type": asset.asset_type, "content": (asset.content or "")[:400] if summary else asset.content, "locator": locator,
+            "content_truncated": bool(summary and len(asset.content or "") > 400),
             "media_type": asset.media_type, "content_hash": asset.content_hash,
             "download_url": f"/knowledge-bases/{knowledge_base_id}/documents/{asset.document_id}/assets/{asset.id}/download" if safe_asset_path(asset.file_path) else None}
 
 
-def enrich_chunks(db, collection_name, chunks, knowledge_base_id=None):
+def hydrate_asset_response(asset, knowledge_base_id, *, query="", chunk_text="", locators=None,
+                           max_chars=5000, max_rows=16):
+    """Bounded verbatim asset context; never describe unread image pixels.
+
+    This pure selection step receives an already authorization-scoped DB asset.
+    Table cells sharing a provider row coordinate stay together. Include leading
+    rows as header context (not an inferred schema), selected rows and neighbours.
+    Omitted context is explicit so a reviewer cannot claim full-table inspection.
+    """
+    result = asset_response(asset, knowledge_base_id)
+    content = str(result.get("content") or "")
+    locator = result.get("locator") or {}
+    max_chars, max_rows = max(0, min(int(max_chars), 20000)), max(0, min(int(max_rows), 64))
+    rows = [row for row in locator.get("table_rows", []) if isinstance(row, dict)]
+    meta = {"status": "complete", "visual_verification": "not_applicable", "content_truncated": False}
+    if result["type"] == "image":
+        result["content"] = content[:max_chars]
+        meta.update(status="visual_unverified", visual_verification="visual_unverified",
+                    content_truncated=len(content) > max_chars,
+                    reason="仅取得解析文本/图注与原图定位，未执行视觉核验；图内数值和曲线不能据此判为已验证")
+    elif result["type"] == "table" and rows:
+        # Bound scanning as well as output; large tables remain explicitly partial.
+        groups = []
+        indices = {}
+        for position, row in enumerate(rows[:2000]):
+            coordinate = next((row[key] for key in ("row_index", "row_start", "row", "ysc")
+                               if isinstance(row.get(key), (int, str))), None)
+            key = ("provider", str(coordinate)) if coordinate is not None else ("position", position)
+            if key not in indices:
+                indices[key] = len(groups)
+                groups.append([])
+            groups[indices[key]].append(row)
+        tokens = set(re.findall(r"[\w.%-]{2,}", (str(query) + " " + str(chunk_text))[:6000].casefold()))
+        def text_of(group):
+            return " | ".join(str(row.get("text") or row.get("content") or
+                                  " | ".join(str(value) for value in row.get("cells", []))) for row in group)
+        scores = [sum(token in text_of(group).casefold() for token in tokens) for group in groups]
+        requested = []
+        for index, group in enumerate(groups):
+            if any(all(row.get(key) == loc[key] for key in loc if key in {"row_index", "row_start", "row_end", "column_index", "column_start", "column_end"})
+                   and any(key in loc for key in {"row_index", "row_start", "row_end"})
+                   for loc in (locators or []) if isinstance(loc, dict) for row in group):
+                requested.append(index)
+        ranked = sorted(range(len(groups)), key=lambda index: (-scores[index], index))
+        chosen = requested + [index for index in ranked if scores[index] > 0][:4]
+        if not chosen:
+            chosen = ranked[:4]
+        priority = list(dict.fromkeys(list(range(min(2, len(groups)))) + chosen +
+                                     [near for index in chosen for near in (index - 1, index + 1) if 0 <= near < len(groups)]))
+        # Preserve genuine non-table captions / units / notes verbatim, bounded.
+        surroundings = "\n".join(line for line in content.splitlines() if not line.lstrip().startswith("|"))
+        surroundings = surroundings[:min(600, max_chars // 3)]
+        selected, used = [], len(surroundings)
+        for index in priority:
+            cost = len(json.dumps(groups[index], ensure_ascii=False)) + len(text_of(groups[index]))
+            if len(selected) < max_rows and used + cost <= max_chars:
+                selected.append(index)
+                used += cost
+        selected.sort()
+        selected_rows = [row for index in selected for row in groups[index]]
+        result["locator"] = {**locator, "table_rows": selected_rows}
+        result["content"] = "\n".join(([surroundings] if surroundings else []) + [text_of(groups[index]) for index in selected])
+        complete = len(selected_rows) == len(rows) and len(surroundings) == len("\n".join(
+            line for line in content.splitlines() if not line.lstrip().startswith("|")))
+        meta.update(status="complete" if complete else "partial" if selected else "unavailable",
+                    content_truncated=not complete, selected_row_groups=len(selected), total_row_records=len(rows),
+                    selected_row_records=len(selected_rows), omitted_row_records=len(rows) - len(selected_rows),
+                    header_context="保留可容纳的前两行组作为表头/单位上下文，不推断字段语义",
+                    reason="有界原文行选择；未返回的行/条件不视为已阅读" if not complete else "原文表格行已完整展开")
+    else:
+        result["content"] = content[:max_chars]
+        meta.update(status="partial" if len(content) > max_chars else "complete", content_truncated=len(content) > max_chars)
+    result["content_truncated"] = meta["content_truncated"]
+    result["hydration"] = meta
+    return result
+
+
+def enrich_chunks(db, collection_name, chunks, knowledge_base_id=None, *, hydrate=False, query="",
+                  max_asset_chars=16000):
     """Two batch queries, with ownership scope supplied by authenticated caller."""
     from models.knowledge import Document, DocumentAsset, DocumentChunkProvenance
     from sqlalchemy.orm import joinedload
@@ -324,12 +404,12 @@ def enrich_chunks(db, collection_name, chunks, knowledge_base_id=None):
     ids = [chunk.get("id") or chunk.get("chunk_id") for chunk in chunks]
     if not ids:
         return chunks
-    query = db.query(DocumentChunkProvenance).options(joinedload(DocumentChunkProvenance.document)).join(Document).filter(
+    provenance_query = db.query(DocumentChunkProvenance).options(joinedload(DocumentChunkProvenance.document)).join(Document).filter(
         DocumentChunkProvenance.collection_name == normalize_collection_name(collection_name),
         DocumentChunkProvenance.chunk_id.in_(ids), Document.status == "completed")
     if knowledge_base_id is not None:
-        query = query.filter(Document.knowledge_base_id == knowledge_base_id)
-    records = query.all()
+        provenance_query = provenance_query.filter(Document.knowledge_base_id == knowledge_base_id)
+    records = provenance_query.all()
     by_id = {row.chunk_id: row for row in records}
     asset_ids = {key for row in records for key in (row.asset_ids or [])}
     asset_query = db.query(DocumentAsset).join(Document).filter(DocumentAsset.id.in_(asset_ids))
@@ -337,6 +417,8 @@ def enrich_chunks(db, collection_name, chunks, knowledge_base_id=None):
         asset_query = asset_query.filter(Document.knowledge_base_id == knowledge_base_id)
     by_asset = {asset.id: asset for asset in asset_query.all()} if asset_ids else {}
     output = []
+    remaining = max(0, min(int(max_asset_chars), 64000))
+    hydrated = {}
     for chunk in chunks:
         row = dict(chunk)
         chunk_id = row.get("id") or row.get("chunk_id")
@@ -344,10 +426,30 @@ def enrich_chunks(db, collection_name, chunks, knowledge_base_id=None):
         record = by_id.get(chunk_id)
         if record:
             kb_id = knowledge_base_id or record.document.knowledge_base_id
-            row.update(document_id=str(record.document_id), document_version=record.document_version,
+            row.update(document_id=str(record.document_id), knowledge_base_id=str(kb_id), document_version=record.document_version,
                        locators=[{key: value for key, value in locator.items() if key != "table_rows"} for locator in record.locators or []], content_hash=record.content_hash,
                        evidence_id="ev_" + record.chunk_id, text_start=record.text_start, text_end=record.text_end,
                        download_url=f"/knowledge-bases/{kb_id}/documents/{record.document_id}/download")
-            row["assets"] = [asset_response(by_asset[key], kb_id, summary=True) for key in record.asset_ids or [] if key in by_asset and by_asset[key].document_id == record.document_id]
+            row["asset_ids"] = []
+            row["assets"] = []
+            for key in record.asset_ids or []:
+                asset = by_asset.get(key)
+                if (not asset or asset.document_id != record.document_id
+                        or asset.document_version != record.document_version):
+                    continue
+                row["asset_ids"].append(key)
+                cache_key = (key, record.chunk_id)
+                if hydrate and knowledge_base_id is not None:
+                    if cache_key not in hydrated:
+                        value = hydrate_asset_response(asset, kb_id, query=query, chunk_text=row.get("content", ""),
+                                                       locators=record.locators, max_chars=min(5000, remaining))
+                        cost = len(value.get("content") or "") + len(json.dumps(value.get("locator", {}).get("table_rows", []), ensure_ascii=False))
+                        remaining = max(0, remaining - cost)
+                        hydrated[cache_key] = value
+                    row["assets"].append(hydrated[cache_key])
+                else:
+                    row["assets"].append(asset_response(asset, kb_id, summary=True))
+            row["asset_hydration"] = {"authorized_scope": bool(knowledge_base_id is not None),
+                                      "requested": bool(hydrate), "remaining_content_chars": remaining}
         output.append(row)
     return output

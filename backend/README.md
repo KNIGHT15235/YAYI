@@ -1,85 +1,52 @@
-# 项目启动
-## 启动中间件
+# YAYI 科研助手后端
+
+FastAPI 提供登录、知识库、文献解析与科研任务接口；六角色 asyncio 执行器负责检索、分析、写作、审核和图表生成。整体流程及本次真实验证结果见 [项目说明](../README.md) 和 [验收报告](../docs/WSL真实全链路验收报告-2026-10-14.md)。
+
+## 环境准备
+
+在 WSL 的独立 Python 环境中操作。本次验证使用 Python 3.10.21；不要将依赖直接安装进系统或 base 环境。
+
+```bash
 cd backend
-docker compose -f docker-compose-base.yml up -d
-
-### 查看中间件状态
-```sh
-$ docker ps
-CONTAINER ID   IMAGE                                    COMMAND                  CREATED          STATUS                             PORTS                              NAMES
-...            redis:7-alpine                           "docker-entrypoint.s…"   ...              Up                                 0.0.0.0:6379->6379/tcp             document-redis
-...            milvusdb/milvus:v2.3.3                   "milvus run standalo…"   ...              Up                                 0.0.0.0:19530->19530/tcp           milvus-standalone
-...            minio/minio:RELEASE.2023-03-20T20-16-18Z "minio server /minio…"   ...              Up                                 0.0.0.0:9000-9001->9000-9001/tcp   milvus-minio
-...            quay.io/coreos/etcd:v3.5.5               "etcd -advertise-cli…"   ...              Up                                                                    milvus-etcd
+python -m pip install -r requirements.txt
 ```
 
-## 安装python依赖包
-pip install -r requirements.txt
+首次配置时将 `.env.example` 复制为 `.env`，已有文件不要覆盖。配置自己的：
 
-## 修改env文件
-填入个人的DASHSCOPE_API_KEY，SERPER_API_KEY
-SERPER_API_KEY获取方法参考：https://serper.dev/
+- PostgreSQL、Redis、Milvus 连接参数与独立数据库。
+- 模型服务凭据，例如 `DASHSCOPE_API_KEY`，以及账户可用的模型名称。
+- DocMind 的 `DOCMIND_ACCESS_KEY_ID`、`DOCMIND_ACCESS_KEY_SECRET`。
+- 应用端口、登录鉴权配置和前端允许访问的 origin。
 
-配置 Milvus 连接（可选，默认 localhost:19530）：
-```
-MILVUS_HOST=localhost
-MILVUS_PORT=19530
-```
+完整变量以 `.env.example` 和代码读取配置为准。凭据仅保存在本地，不提交到仓库。准备基础服务时检查 Compose 的容器名、端口和数据卷；已有实例应复用或隔离，不能为启动本项目删除旧数据。
 
-配置 DocMind 文档解析服务：
-```
-DOCMIND_ACCESS_KEY_ID=your_access_key_id
-DOCMIND_ACCESS_KEY_SECRET=your_access_key_secret
+## 本机已验证的启动方式
+
+```bash
+cd /mnt/d/ldj/01/YAYI_0929/backend
+DEFAULT_MODEL=qwen-plus NEWS_COLLECTION_ENABLED=false MEMORY_AUTO_ENABLED=false \
+  /home/ldj/anaconda3/envs/yayi_b/bin/python app/app_main.py
 ```
 
-# 临时添加环境变量
-# 用您的百炼API Key代替YOUR_DASHSCOPE_API_KEY
-export DASHSCOPE_API_KEY="YOUR_DASHSCOPE_API_KEY"
+本机 `APP_PORT=8029`，接口文档为 http://localhost:8029/docs，存活检查为 http://localhost:8029/hello。其他机器按实际路径、环境和端口替换；默认值不代表本机覆盖配置。此启动方式修改代码后需要重启。
 
-## 启动后端服务
-python app/app_main.py
+模型选择顺序：角色 `*_MODEL` > `DEFAULT_MODEL` > 保存的研究配置/默认值。恢复任务会记录实际使用的模型；不会因请求失败暗中切换供应商。
 
-启动完成后，本机浏览器访问 `http://localhost:8000` 会跳转到 `/docs` 接口文档；`http://localhost:8000/hello` 用于存活检查。终端中的 `0.0.0.0:8000` 表示监听所有网卡，请使用 `localhost` 或服务器实际 IP 访问。
+## 科研链路与接口验证
 
-`Application startup complete` 表示启动成功。旧版未注册 `/` 和 `/favicon.ico`，因此浏览器打开根地址会记录 404；现已增加首页跳转和图标空响应（204）。使用上述命令启动时，修改代码后需重启后端。完整业务界面由前端提供：另开终端进入 `frontend`，运行 `npm run dev`，访问 `http://localhost:5183/login`（如端口占用，以 Vite 实际输出为准）。
+1. 通过前端登录并创建知识库，上传测试文献。
+2. 等待 DocMind 解析、资产/片段持久化、embedding 和 Milvus 索引完成。
+3. 发起 `profile_id=science` 的科研任务，绑定当前用户有权访问的知识库。
+4. 检查写前分析补检、审核后的修订分支、SSE事件、引用身份和版本。
+5. 停止并恢复，确认 checkpoint 与消耗预算保留；新任务使用新会话。
 
+API 需要相应登录身份与资源权限，请通过 `/docs` 查看当前请求模型，不沿用旧版匿名调用示例。已有研究的会话再次启动返回409，恢复与追加复核使用专用入口，不直接覆盖检查点。
 
-# 接口测试
-### 上传文档,用于本地知识库的查询
-```sh
-cd backend
-curl -X POST "http://localhost:8000/documents/upload"   -H "Content-Type: multipart/form-data"   -F "file=@./test/test_doc.pdf"
+真实验收脚本位于 `audit/`。只读连接检查：
 
-{"status":"success","message":"成功处理 25 个切片","document_count":25}
+```bash
+cd /mnt/d/ldj/01/YAYI_0929
+/home/ldj/anaconda3/envs/yayi_b/bin/python audit/live_acceptance.py preflight
 ```
 
-### 创建会话
-```sh
-curl -s -X POST http://localhost:8000/chat/session
-
-{"session_id":"02c32f19-b7f0-42ea-b3c1-7d2bc148c21b","created_at":1751194296,"updated_at":1751194296,"message_count":0}
-```
-
-### 问答
-```sh
-curl -N -X POST http://localhost:8000/chat/completion \
-  -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
-  -d "{
-    \"session_id\": \"02c32f19-b7f0-42ea-b3c1-7d2bc148c21b\",
-    \"question\": \"如何解决dify_setups表不存在的问题？\"
-  }"
-
-```
-
-
-### deepseach
-```sh
-curl -N -X POST "http://localhost:8000/research/stream" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "安责险在矿山行业的应用现状、面临的主要挑战以及改进建议有哪些？",
-    "max_iterations": 2
-  }'
-
-```
+离线回归的完整20模块命令、真实上传/研究操作和故障注入边界见 [验收报告](../docs/WSL真实全链路验收报告-2026-10-14.md)。真实服务测试会创建独立测试数据，并可能产生模型、解析和向量服务费用；不要把运行快照、测试账号密码或令牌提交到Git。

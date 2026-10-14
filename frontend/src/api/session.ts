@@ -232,10 +232,18 @@ export function cancelResearch(sessionId: string) {
   return request.post<{ success: boolean; message: string }>(`/research/cancel/${sessionId}`, {}, { loading: false })
 }
 
-export function resumeResearch(sessionId: string) {
-  return request.post<ReadableStream>(`/research/resume/${encodeURIComponent(sessionId)}`, {}, {
+export interface ResumeResearchOptions {
+  additional_iterations?: number
+  use_remaining_budget?: boolean
+  review_notes?: string
+  review_claim_ids?: string[]
+}
+
+export function resumeResearch(sessionId: string, body: ResumeResearchOptions = {}, options?: AxiosRequestConfig) {
+  return request.post<ReadableStream>(`/research/resume/${encodeURIComponent(sessionId)}`, body, {
     headers: { Accept: 'text/event-stream' }, responseType: 'stream', adapter: 'fetch',
     loading: false, errorToast: false, cancelRepeat: false,
+    ...options,
   })
 }
 
@@ -243,7 +251,7 @@ export function resumeResearch(sessionId: string) {
 
 export interface ResearchStep {
   type: string
-  status: 'pending' | 'running' | 'completed'
+  status: 'pending' | 'running' | 'completed' | 'paused' | 'failed'
   stats?: Record<string, number>
 }
 

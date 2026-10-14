@@ -4,7 +4,10 @@ import { viteMockServe } from 'vite-plugin-mock'
 
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd()) as {
+  // Deterministic offline verification must not consume a developer's .env.
+  const env = (process.env.YAYI_OFFLINE_BUILD === '1'
+    ? { VITE_API_BASE: '/api', VITE_API_PROXY: 'http://127.0.0.1:8000' }
+    : loadEnv(mode, process.cwd())) as {
     VITE_API_BASE: string
     VITE_API_PROXY: string
   }

@@ -24,13 +24,55 @@ import httpx
 
 log = logging.getLogger(__name__)
 API = 'https://api.crossref.org/works'
-CACHE_VERSION = 4
+CACHE_VERSION = 6
 CACHE_DIR = Path(os.getenv('LITERATURE_CACHE_DIR', str(Path(__file__).resolve().parents[3] / 'storage' / 'literature')))
 
 
 def plain_text(value: Any) -> str:
     text = re.sub(r'<[^>]+>', ' ', str(value or ''))
     return re.sub(r'\s+', ' ', html.unescape(text)).strip()
+
+
+_INTERNAL_QUERY_ID = re.compile(
+    r'(?<![A-Za-z0-9_])(?:ev|claim|task|asset|quote|chunk|paper|analysis_search|review_search)_'
+    r'(?:[0-9a-f]{8,64}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?![A-Za-z0-9_-])', re.I)
+_QUERY_UUID = re.compile(r'(?<![A-Za-z0-9_])[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![A-Za-z0-9_])', re.I)
+
+
+def sanitize_search_query(value: Any) -> str:
+    """Strip internal provenance identifiers, not domain words or DOI syntax.
+
+    This is a final provider guard, not a diagnosis-to-keywords generator. The
+    planning/analysis contract must supply search_queries separately from reason.
+    Match generated ID shapes so e.g. the legitimate term asset_allocation stays.
+    """
+    if not isinstance(value, str):
+        return ''
+    text = _INTERNAL_QUERY_ID.sub(' ', plain_text(value))
+    text = _QUERY_UUID.sub(' ', text)
+    text = re.sub(r'\s+', ' ', text).strip(' ,;，；[](){}')[:700].strip()
+    return text if re.search(r'[A-Za-z0-9\u4e00-\u9fff]', text) else ''
+
+
+def provider_search_terms(values) -> list[str]:
+    """Read only explicit query fields; never stringify a diagnostic object."""
+    if isinstance(values, (str, dict)):
+        values = [values]
+    if not isinstance(values, (list, tuple)):
+        return []
+    result = []
+    for value in values:
+        if isinstance(value, dict):
+            queries = value.get('search_queries')
+            queries = queries if isinstance(queries, (str, list, tuple)) and queries else value.get('query')
+            candidates = [queries] if isinstance(queries, str) else queries if isinstance(queries, (list, tuple)) else []
+        else:
+            candidates = [value]
+        for candidate in candidates:
+            term = sanitize_search_query(candidate)
+            if term and term.casefold() not in {item.casefold() for item in result}:
+                result.append(term)
+    return result
 
 
 def query_scope(query: str) -> dict:
@@ -40,22 +82,23 @@ def query_scope(query: str) -> dict:
     end = min(end, today.year)
     if start > end:
         raise ValueError('研究起始年份晚于当前年份')
-    optical_cd = bool(re.search(r'变化检测|change\s+detection', query, re.I) and re.search(r'遥感|optical|remote\s+sensing', query, re.I))
-    if optical_cd:
-        searches = [
-            'optical remote sensing image change detection',
-            'remote sensing change detection transformer siamese deep learning',
-            'high resolution aerial building change detection attention',
-            'remote sensing change detection foundation model SAM Mamba',
-            'remote sensing change detection generalization self supervised',
-            'optical remote sensing change detection review benchmark',
-        ]
+    remote_cd = bool(re.search(r'变化检测|change\s+detection', query, re.I) and re.search(r'遥感|optical|remote\s+sensing', query, re.I))
+    optical_cd = remote_cd and bool(re.search(r'光学|optical', query, re.I))
+    if remote_cd:
+        modalities = []
+        if optical_cd:
+            modalities.append('optical')
+        if re.search(r'\bSAR\b|radar|雷达', query, re.I):
+            modalities.append('SAR')
+        searches = [(' '.join(modalities) + ' remote sensing image change detection').strip()]
     else:
         cleaned = re.sub(r'围绕|开展文献调研|生成文献综述|请|文献综述|[，。]', ' ', query)
         searches = [re.sub(r'\s+', ' ', cleaned).strip()]
     return {'start_year': start, 'end_year': end, 'until': min(date(end,12,31),today).isoformat(),
         'original_query': query,
-        'optical_change_detection': optical_cd, 'searches': searches}
+        'optical_change_detection': optical_cd, 'remote_change_detection': remote_cd,
+        'exclude_radar': bool(re.search(r'(?:排除|不包括|不含|exclude|without)\s*(?:SAR|radar|雷达)', query, re.I)),
+        'searches': searches}
 
 
 class RetrievalBudgetExhausted(Exception):
@@ -89,19 +132,18 @@ class RetrievalBudget:
 
 def targeted_searches(scope, terms=None):
     """Keep the original scope separate from the new, effective provider query."""
+    anchors = provider_search_terms(scope['searches'])
+    terms = provider_search_terms(terms)
     if not terms:
-        return list(scope['searches'])
-    anchor = scope['searches'][0]
+        return anchors
+    anchor = anchors[0] if anchors else ''
     result = []
-    for value in terms:
-        term = plain_text(value)[:700]
-        if not term:
-            continue
+    for term in terms:
         # A follow-up mentioning a year cannot expand the original date filter.
         actual = term if anchor.casefold() in term.casefold() else anchor + ' ' + term
         if actual.casefold() not in {x.casefold() for x in result}:
             result.append(actual)
-    return result or list(scope['searches'])
+    return result or anchors
 
 
 def publication_date(item: dict) -> Optional[date]:
@@ -128,7 +170,9 @@ def method_tags(text: str) -> list[str]:
 
 
 def relevant(title: str, abstract: str, scope: dict) -> bool:
-    if not scope['optical_change_detection']:
+    if scope.get('exclude_radar') and re.search(r'\bSAR\b|radar|雷达', title, re.I):
+        return False
+    if not scope.get('remote_change_detection', scope.get('optical_change_detection')):
         # Match original-topic anchors, never generated follow-up words. These
         # guards remove obvious fuzzy-search drift while retaining multilingual
         # records. Arbitrary untranslated Chinese topics still rely on the
@@ -162,11 +206,11 @@ def relevant(title: str, abstract: str, scope: dict) -> bool:
     t = title.lower()
     if not re.search(r'change[ -]?detection|change[ -]?detecting', t):
         return False
-    # The demonstration is optical image CD, not radar/hyperspectral or
-    # cross-modality change detection, ecological time-series, or medical CD.
-    if re.search(r'\bSAR\b|radar|polarimetric|hyperspectral|heterogeneous|cross.modality|multimodal|multi.modal|optical.sar|sar.optical', title, re.I):
-        return False
     combined = title+' '+abstract
+    # User scope, never an implicit demo domain, determines modalities. A
+    # multi-modal/SAR comparison is valid unless explicitly excluded.
+    if scope.get('optical_change_detection') and not re.search(r'optical|光学|LEVIR|WHU.CD|SYSU.CD|aerial', combined, re.I):
+        return False
     return bool(re.search(r'remote.sensing|optical|aerial|satellite|LEVIR|WHU.CD|SYSU.CD|building change', combined,re.I))
 
 
@@ -261,17 +305,15 @@ def _select(papers: list[dict], limit: int) -> list[dict]:
 
 
 async def _arxiv(client, scope: dict, search_terms=None, budget=None) -> list[dict]:
-    if not scope['optical_change_detection']:
+    # Planner's English queries also enable non-remote-sensing arXiv research.
+    # Tokens are escaped data, not model-authored query language operators.
+    focus = ' '.join(provider_search_terms(search_terms) or provider_search_terms(scope['searches']))
+    ignored = {'and', 'or', 'not', 'all', 'research', 'evidence', 'review', 'literature', 'study'}
+    tokens = list(dict.fromkeys(t.lower() for t in re.findall(r'[A-Za-z][A-Za-z0-9_-]{2,}', focus)
+                               if t.lower() not in ignored))[:12]
+    if not tokens:
         return []
-    search='ti:"change detection" AND (all:"remote sensing" OR all:"optical" OR all:"aerial")'
-    if search_terms:
-        # Treat generated terms as data, not arXiv query-language operators.
-        focus = ' '.join(plain_text(t) for t in search_terms)
-        tokens = re.findall(r'[A-Za-z][A-Za-z0-9_-]{2,}', focus)
-        ignored = {'and', 'or', 'not', 'all', 'change', 'detection', 'remote', 'sensing', 'optical', 'image', 'images', 'research', 'evidence'}
-        tokens = list(dict.fromkeys(t.lower() for t in tokens if t.lower() not in ignored))[:16]
-        if tokens:
-            search += ' AND (' + ' OR '.join('all:"' + t + '"' for t in tokens) + ')'
+    search = ' AND '.join('all:"' + t + '"' for t in tokens)
     search+=f" AND submittedDate:[{scope['start_year']}01010000 TO {scope['until'].replace('-','')}2359]"
     if budget:
         budget.charge('request')

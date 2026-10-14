@@ -1,85 +1,109 @@
 # YAYI 雅意 · AI-Scientist 科研助手
 
-仓库保存源码、配置示例、验证脚本和说明文档，不包含本机 `.env`、上传文献、解析资产、运行快照、日志或依赖目录。首次配置请复制 `backend/.env.example` 为 `backend/.env` 并填写自己的凭据；已有本地配置不要覆盖。`start-services.sh` 从该环境文件读取数据库密码，示例中的占位密码需自行替换。下文的演示历史与运行结果属于本机数据，不会随克隆自动出现。
+面向科研文献调研的本地 Demo，围绕文献检索、证据分析、综述写作、引用审核与可视化，展示可追溯、可修订、可恢复的多 Agent 研究流程。
 
-此目录是 `D:\ldj\01\source\industry_information_assistant` 的独立副本。复用原有六 Agent、FastAPI、React、DocMind、Milvus、PostgreSQL、Redis、SSE 和 checkpoint，新增科研配置、真实文献采集、证据及声明核验、文献资产定位和科研展示页面。
+**技术栈：** Python · FastAPI · asyncio · DeepSeek/Qwen · DocMind · Milvus · PostgreSQL · Redis · React/TypeScript · ECharts
 
-## 本机运行
+当前执行器是六角色 **asyncio 异步状态机**，通过 `asyncio.Queue` 汇集事件、SSE 推送进度；不是依赖 LangGraph 执行的版本。本仓库是工程演示，不包含生产平台的文献规模、私有数据或服务能力。
 
-已配置 WSL Ubuntu-24.04 的 `yayi_b` 环境，无需重新安装。保留当前 `backend/.env`，其中包含用户原有 API 配置。基础容器复用原项目正在运行的实例，数据使用独立数据库。
+## 科研流程
 
-| 项目 | 当前配置 |
+```text
+研究问题 → Planner 规划 → Retriever 检索 → Analysis 评估证据
+                              ↑                │
+                              └── 证据不足：有界补检 ┘
+                                               ↓
+                              Visualizer 生成文献集图表
+                                               ↓
+                                     Writer 写作 → Reviewer 审核
+                                               ↑          │
+                             定向补检 / 重新分析 / 局部修订 ←┘
+                                               ↓
+                                    报告、引用与明确的质量状态
+```
+
+- **文献入库与追溯：** DocMind 解析文献，保存片段、独立资产和原文位置；embedding 与 Milvus 检索使用同一知识库身份，研究结果能回到同版本文档或表格资产。
+- **统一证据：** 本地知识库与 Crossref/arXiv 学术记录进入统一来源和证据模型，区分文献数与片段数。只有摘要时明确限制，不声称完成全文精读。
+- **写前与写后双闭环：** Analysis 判断证据覆盖，不足时有界补检；Reviewer 按声明核验，并决定补检、重新分析或局部修订。初检、补检共享总预算，恢复不重置消耗。
+- **引用约束：** `quote_id` 绑定服务端原文、证据身份和版本，服务端回填引用；定位字段校验与结论支撑性审核分开，定位成功不等于事实正确。
+- **状态与交互：** PostgreSQL 保存研究状态和 checkpoint，Redis 管理取消与研究租约；支持停止恢复、人工追加复核、旧报告归档及同会话防覆盖。
+- **科研展示：** React 展示阶段进度、文献库、声明审核、知识图谱、ECharts 图表和报告。文献分布图仅描述本次检索集，不代表整个领域规模或方法性能。
+
+## 本机 WSL 运行
+
+以下是本次实际验收环境，而非克隆仓库后自动具备的配置：
+
+| 组件 | 已验收配置 |
 |---|---|
-| 网页 | http://localhost:5199 |
-| 后端 / 接口文档 | http://localhost:8029/docs |
-| Python | `/home/ldj/anaconda3/envs/yayi_b/bin/python` |
+| WSL / Python | Ubuntu-24.04 / Conda `yayi_b`，Python 3.10.21 |
+| 前端 | http://localhost:5199 |
+| 后端接口文档 | http://localhost:8029/docs |
 | PostgreSQL | `localhost:15432`，数据库 `yayi_0929` |
-| Redis | `localhost:16379`，DB `9` |
+| Redis | `localhost:16379`，研究租约与取消使用 DB `9` |
 | Milvus | `localhost:29530`，数据库 `yayi_0929` |
 
-两个 WSL 终端分别执行：
+首次部署需要安装后端与前端依赖、准备基础服务，并将 `backend/.env.example` 复制为 `backend/.env` 后填写自己的连接配置和凭据。已有配置不要覆盖。前端本地环境需配置 `VITE_API_BASE=/api`、`VITE_API_PROXY=http://127.0.0.1:8029`；详情见 [后端说明](backend/README.md) 与 [前端说明](frontend/README.md)。
+
+在本机已配置的环境中，分别启动两个 WSL 终端：
 
 ```bash
-cd /mnt/d/ldj/01/YAYI_0929
-bash run-yayi.sh backend
+# 终端一：后端；显式使用本次账户已验证可用的模型
+cd /mnt/d/ldj/01/YAYI_0929/backend
+DEFAULT_MODEL=qwen-plus NEWS_COLLECTION_ENABLED=false MEMORY_AUTO_ENABLED=false \
+  /home/ldj/anaconda3/envs/yayi_b/bin/python app/app_main.py
 ```
 
 ```bash
-cd /mnt/d/ldj/01/YAYI_0929
-bash run-yayi.sh frontend
+# 终端二：前端
+cd /mnt/d/ldj/01/YAYI_0929/frontend
+node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5199 --strictPort
 ```
 
-若地址已能访问，直接打开网页即可，无需重复启动。后端代码修改后重启后端；前端已开启 WSL 文件轮询。`bash run-yayi.sh status` 查看存活状态。基础容器停止时，在原项目目录运行 `./start-services.sh start`；副本内保留的 Compose 文件属于复制过来的基础服务配置，不应与原项目重复启动相同容器。
+模型优先级为角色 `*_MODEL` > `DEFAULT_MODEL` > 已保存的配置/默认值，具体模型需在所用供应商账户中可用。服务已运行时不要重复启动；端口冲突先确认占用进程。不要在研究运行中修改前端源码触发热更新，否则 SSE 断开会按中断处理。
 
-初始化新数据库时才执行（本机已经完成）：
+不同机器请替换上述路径和端口。不要重复启动与既有服务同名、同端口的容器，也不要为运行 Demo 清空数据库。真实模型、文档解析、embedding 和重排调用可能产生供应商费用。
 
-```bash
-/home/ldj/anaconda3/envs/yayi_b/bin/python audit/bootstrap_yayi.py
-```
+## 体验科研链路
 
-## 展示
+1. 登录后创建知识库，上传可用于测试的文献，确认解析与索引完成。
+2. 在“深度研究”选择知识库或全部搜索，提出明确的科研问题和范围。
+3. 观察检索、分析、补检、写作和审核事件；点击报告引用查看原文摘录与资产。
+4. 长任务可停止后恢复；新研究使用“新建研究”，不覆盖原会话。
+5. 对已结束报告使用“追加复核”，选择声明并填写具体意见，比较归档与修订结果，同时检查质量状态。
 
-展示账户：`yayi_demo`。本机密码保存在 `backend/storage/demo-access.json`，该文件只用于本机登录，不应提交或分享。进入“研究历史”打开 **2020—2026光学遥感变化检测文献综述**。其精确查询为：
+示例问题：
 
-> 围绕2020-2026年光学遥感图像变化检测方法开展文献调研，生成文献综述。
+> 围绕2020–2026年光学遥感图像变化检测方法开展文献调研，比较主要方法、评价设置与证据局限，生成带引用的文献综述。
 
-研究包含真实文献集合、提出和核验的假设、知识图谱、可复算的文献分布图、综述、引用及逐段核验记录。知识库 **遥感变化检测论文** 保存 BIT 论文原件、可定位文本和提取的图表资产。
+仓库不附带测试账号、已上传文献或研究历史；克隆后需要自行创建测试资源。
 
-以同样条件重新执行完整测试（会调用已配置的模型和向量服务，并新建历史）：
+## 验证与当前边界
 
-```bash
-/home/ldj/anaconda3/envs/yayi_b/bin/python -u audit/run_science_demo.py --kb 遥感变化检测论文
-```
+本轮 WSL 验证：后端离线 **343/343（20模块）**，前端辅助逻辑 **29/29**，TypeScript 和生产构建通过。真实 DocMind、DashScope、Milvus、PostgreSQL、Redis 及浏览器链路已执行；混合研究实际完成两轮写前补检和两轮审核后补检。
 
-公开文献来源为 Crossref 注册元数据及 arXiv 作者摘要，按日期、题名、主题过滤并去重。`verified` 表示来源身份已核对；内容声明另行审核。文献分布图反映本次检索样本，方法关键词可以多标签计数，不代表整个领域的论文总量或性能排名。
+**工程链跑通不等于内容质量全部通过。** 本次混合研究最终仍有2条证据不足、1条未核验；人工目标正文已修改，但人工完成状态仍与其他自动修订问题耦合。部分模型审核存在原文判读和过度泛化问题，详见验收报告。当前仍是进程内执行器，未实现独立 Worker、持久化任务队列或 exactly-once 语义。
 
-## 实施与验收资料
-
-- [实施版项目文档](docs/雅意原型-实施版.md)
-- [代码修改方案与实施映射](docs/雅意原型-代码修改方案.md)
-- [本次测试和输出审核](audit/YAYI_0929验收报告.md)
-- [生成的综述](audit/demo-report.md)
-- 本机运行记录与历史编号：`audit/demo-run-summary.json`（不随仓库上传）
-- 本机120篇文献来源复核：`audit/demo-literature-source-audit.json`（不随仓库上传）
-- [正文与假设的独立内容审核](audit/content-review-final.md)
-- 本机真实 PDF 资产及检索测试：`audit/science-assets-live.json`（不随仓库上传）
-- [数据库探索与科研资讯演示操作](docs/数据库探索与科研资讯演示操作.md)
-
-`audit/demo-events.jsonl` 是原始 SSE，`demo-result.json` 是最终结构化结果，`demo-checkpoint.json` 和 `demo-history.json` 用于核对持久化恢复。审计数据不包含登录 token。项目中保留的旧核对报告描述复制前版本，以本次实施文档和验收报告为准。
-
-## 常用验证
+合成测试材料只验证工程链路，不能用于证明 Recall@20=91% 或引文事实错误率12%→3%。任意 PDF 字符级高亮、图像事实理解、正式质量评测与生产性能也不属于本轮已通过范围。
 
 ```bash
-cd /mnt/d/ldj/01/YAYI_0929
-/home/ldj/anaconda3/envs/yayi_b/bin/python audit/test_science_engine.py
-/home/ldj/anaconda3/envs/yayi_b/bin/python audit/test_science_assets.py
+# 在仓库根目录运行；完整20模块命令见验收报告
+/home/ldj/anaconda3/envs/yayi_b/bin/python audit/live_acceptance.py preflight
+
 cd frontend
+npm run test:workflow
 npm run typecheck
-npm run build
+npm run test:build
 ```
 
-网页包含独立首页、深度研究、研究历史、记忆库、知识库管理、数据库探索与科研资讯。“深度研究”页可直接切换 **科研背景调研 / 行业调研**：科研发送 `profile_id=science`，行业发送 `profile_id=industry`；历史及恢复沿用原会话模式。
+`preflight` 只检查现有配置与服务，不输出密钥；前端辅助逻辑测试不是浏览器端到端测试的替代。
 
-科研路径中 Analyze 只分析证据、假设与缺口，Review 统一决定补检。补检后重新 Analyze、更新图谱和图表，再修订原报告。Scout 的初次检索及审核授权补检均支持有界递归，默认深度 2、分支 2、额外递归查询 8；预算及队列随检查点保存。详见 [实施方案](docs/科研补检与递归深挖调整方案.md) 和 [本轮验证](audit/科研补检与模式切换验证.md)。
+## 文档与目录
 
-定时行业资讯采集通过 `NEWS_COLLECTION_ENABLED=false` 关闭，研究与记忆任务继续使用独立状态。
+- [科研流程改进方案与推进进度](docs/科研流程改进方案与进度.md)
+- [WSL真实全链路验收报告与复现步骤](docs/WSL真实全链路验收报告-2026-10-14.md)
+- `backend/`：FastAPI、科研 Agent、文献解析与检索、证据和任务状态。
+- `frontend/`：科研交互、原文预览、审核面板与图表。
+- `audit/`：离线回归、隔离故障与真实服务验收脚本。
+- `docs/`：方案、进度与验收记录；较早文档描述历史版本，以以上两份最新文档为准。
+
+仓库只发布源码、配置示例、测试脚本与脱敏文档。`.env`、访问凭据、上传文献、解析资产、运行快照、日志、依赖和构建目录均不随版本发布。不要上传 `backend/storage/` 下的运行记录或凭据。

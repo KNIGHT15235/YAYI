@@ -20,6 +20,16 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
 
+def resolve_agent_model(agent_name: str, fallback: str) -> str:
+    """Explicit role override > DEFAULT_MODEL > saved/profile/default model.
+
+    This only resolves configuration; provider failures never select another model.
+    Blank environment values are treated as unset.
+    """
+    role_model = os.getenv(f"{agent_name.upper()}_MODEL", "").strip() if agent_name else ""
+    return role_model or os.getenv("DEFAULT_MODEL", "").strip() or fallback
+
+
 @dataclass
 class AgentModelConfig:
     """单个 Agent 的模型配置"""
@@ -40,42 +50,42 @@ class AgentsConfig:
     """所有 Agent 的配置"""
     # 规划师 - 分析问题，生成研究大纲
     architect: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
-        model="deepseek-v3.2",
+        model=resolve_agent_model("architect", "deepseek-v3.2"),
         temperature=0.7,
         max_tokens=4000
     ))
 
     # 侦察员 - 深度搜索（使用较快的模型）
     scout: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
-        model="qwen-plus",  # 搜索阶段用快速模型
+        model=resolve_agent_model("scout", "qwen-plus"),  # 搜索阶段用快速模型
         temperature=0.5,
         max_tokens=4000
     ))
 
     # 数据分析师 - 数据提取和分析
     data_analyst: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
-        model="qwen-plus",
+        model=resolve_agent_model("data_analyst", "qwen-plus"),
         temperature=0.3,
         max_tokens=8000
     ))
 
     # 代码极客 - 代码生成和图表绘制
     wizard: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
-        model="deepseek-v3.2",
+        model=resolve_agent_model("wizard", "deepseek-v3.2"),
         temperature=0.3,
         max_tokens=8000
     ))
 
     # 审核采用支持JSON输出的模型；独立配置，不影响其他研究Agent。
     critic: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
-        model=os.getenv("CRITIC_MODEL", "qwen-plus"),
+        model=resolve_agent_model("critic", "qwen-plus"),
         temperature=0,
         max_tokens=16000
     ))
 
     # 首席写手 - 报告撰写
     writer: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
-        model="deepseek-v3.2",
+        model=resolve_agent_model("writer", "deepseek-v3.2"),
         temperature=0.7,
         max_tokens=16000
     ))
@@ -118,7 +128,7 @@ class LLMConfig:
     search_api_key: str = field(default_factory=lambda: os.getenv("BOCHA_API_KEY", ""))
 
     # 默认模型（用于未单独配置的场景）
-    default_model: str = "deepseek-v3.2"
+    default_model: str = field(default_factory=lambda: resolve_agent_model("", "deepseek-v3.2"))
 
     # Agent 配置
     agents: AgentsConfig = field(default_factory=AgentsConfig)

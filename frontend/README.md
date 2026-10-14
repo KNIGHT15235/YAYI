@@ -3,6 +3,7 @@
 ## 快速开始
 
 ### 环境要求
+
 - Node.js >= 18
 - npm >= 9
 
@@ -32,7 +33,7 @@ chmod +x node_modules/.bin/*
 
 #### 当前 Windows / WSL 环境
 
-在 WSL Ubuntu-24.04 中进入 `/mnt/d/ldj/01/YAYI_0929/frontend` 后运行命令。开发服务器通过 `/api` 代理到 `http://127.0.0.1:8029`。`npm run dev`、`build` 和 `preview` 直接调用已安装 Vite 的 Node 入口，兼容复制目录后 `.bin` 链接缺失的情况。
+在 WSL Ubuntu-24.04 中进入 `/mnt/d/ldj/01/YAYI_0929/frontend` 后运行命令。开发服务器通过 `/api` 代理到 `http://127.0.0.1:8029`。`npm run dev`、`build` 和 `preview` 直接调用已安装 Vite 的 Node 入口，兼容复制目录后 `.bin` 链接缺失的情况。环境与依赖应在 WSL 内保持一致。
 
 ---
 
@@ -56,16 +57,18 @@ chmod +x node_modules/.bin/*
 
 ## 科研入口与验证
 
-默认 `VITE_RESEARCH_PROFILE=science`，保留行业功能代码，通过配置切换；科研入口显示新的研究、研究历史、记忆库和知识库。展示问题：
+科研请求使用 `profile_id=science`；科研入口展示新的研究、研究历史、记忆库和知识库。展示问题：
 
 > 围绕2020-2026年光学遥感图像变化检测方法开展文献调研，生成文献综述。
 
 右侧展示搜索结果、文献库、假设与审核、知识图谱、可视化图表与过程报告。来源核对标签只表示文献身份或元数据已核对；逐声明的支持关系与未核验项在“假设与审核”中单独展示。位置字段只展示后端实际解析值。
 
 ```bash
+npm run test:workflow
 npm run typecheck
-node --test audit/research-contract.test.mjs
-npm run build
+npm run test:build
 ```
 
 历史恢复同时兼容旧引用字段、新科研元数据及服务端 checkpoint。生产环境部署须将 `/api` 反向代理到后端。
+
+首次运行需在前端本地环境文件中设置 `VITE_API_BASE=/api`、`VITE_API_PROXY=http://127.0.0.1:8029`，已有配置不要覆盖。本轮通过29项辅助逻辑测试、类型检查和WSL构建；实际浏览器还验证了停止/恢复、会话隔离、人工追加复核、版本化引用与ECharts展示。完整记录与质量限制见 [真实验收报告](../docs/WSL真实全链路验收报告-2026-10-14.md)。辅助逻辑测试不是DOM测试的替代，执行结束也不表示审核全部通过。
