@@ -103,7 +103,8 @@ class VectorTests(unittest.TestCase):
         self.assertEqual(collection.query.call_args.kwargs["expr"], 'filename == "a\\"b.txt"')
 
     def test_rename_keeps_old_data_and_refuses_existing_destination(self):
-        service = MilvusService.__new__(MilvusService)
+        with patch.object(MilvusService, "_connect"):
+            service = MilvusService()
         with patch("service.milvus_service.utility.has_collection", side_effect=[False, True]), \
                 patch("service.milvus_service.utility.rename_collection") as rename:
             service.rename_collection("kb_原名", "kb_新名")

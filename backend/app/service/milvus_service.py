@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from typing import List, Dict, Any, Optional
+from service.bm25_service import BM25Cache, HybridConfig
 from pymilvus import (
     connections,
     Collection,
@@ -29,6 +30,7 @@ class MilvusService:
         self.host = os.getenv("MILVUS_HOST", "localhost")
         self.port = int(os.getenv("MILVUS_PORT", "19530"))
         self.vector_dim = 1024  # text-embedding-v4 维度
+        self._keyword_cache = BM25Cache()
         self._connect()
 
     def _connect(self):
@@ -126,8 +128,12 @@ class MilvusService:
 
         # 插入数据
         data = [ids, doc_ids, kb_ids, filenames, contents, chunk_indices, vectors]
-        collection.upsert(data)
-        collection.flush()
+        try:
+            collection.upsert(data)
+            collection.flush()
+        finally:
+            # Invalidate even if an RPC failed after the server accepted a write.
+            self._keyword_cache.invalidate(normalize_collection_name(collection_name))
 
         print(f"成功插入 {len(documents)} 条文档到 {collection_name}")
         return len(documents)
@@ -193,6 +199,55 @@ class MilvusService:
 
         return formatted_results
 
+    def iter_keyword_chunks(self, collection_name, kb_id=None):
+        """Scan all scoped text, not just ANN hits; no offset/result-window cap."""
+        collection_name = normalize_collection_name(collection_name)
+        if not utility.has_collection(collection_name, timeout=10):
+            return
+        collection = Collection(collection_name, timeout=10)
+        collection.load(timeout=10)
+        iterator = collection.query_iterator(
+            expr=f'kb_id == {json.dumps(kb_id)}' if kb_id else 'id != ""',
+            output_fields=["id", "content"], batch_size=256,
+            consistency_level="Strong", timeout=10,
+        )
+        try:
+            while True:
+                rows = iterator.next()
+                if not rows:
+                    break
+                yield from rows
+        finally:
+            iterator.close()
+
+    def search_keyword(self, collection_name, question, top_k=50, kb_id=None, config=None):
+        """BM25 recall with fresh, scope-filtered metadata from authoritative rows."""
+        config = config or HybridConfig.from_env()
+        collection_name = normalize_collection_name(collection_name)
+        index = self._keyword_cache.get(
+            collection_name, kb_id,
+            lambda: self.iter_keyword_chunks(collection_name, kb_id), config,
+        )
+        matches = index.search(question, top_k, config.k1, config.b)
+        if not matches:
+            return []
+        if not utility.has_collection(collection_name, timeout=10):
+            self._keyword_cache.invalidate(collection_name)
+            return []
+        collection = Collection(collection_name, timeout=10)
+        collection.load(timeout=10)
+        expr = f'id in {json.dumps([identity for identity, _ in matches])}'
+        if kb_id:
+            expr += f' and kb_id == {json.dumps(kb_id)}'
+        rows = collection.query(
+            expr=expr, output_fields=["id", "doc_id", "kb_id", "filename", "content", "chunk_index"],
+            consistency_level="Strong", timeout=10,
+        )
+        by_id = {row["id"]: row for row in rows}
+        # Stale cached IDs cannot resurrect deleted chunks or stale source text.
+        return [{**by_id[identity], "score": None, "bm25_score": score}
+                for identity, score in matches if identity in by_id]
+
     def delete_by_doc_id(self, collection_name: str, doc_id: str) -> bool:
         """
         根据文档ID删除所有相关切片
@@ -217,6 +272,8 @@ class MilvusService:
         except Exception as e:
             print(f"删除文档失败: {e}")
             return False
+        finally:
+            self._keyword_cache.invalidate(collection_name)
 
     def delete_collection(self, collection_name: str) -> bool:
         """
@@ -237,6 +294,8 @@ class MilvusService:
         except Exception as e:
             print(f"删除集合失败: {e}")
             return False
+        finally:
+            self._keyword_cache.invalidate(collection_name)
 
     def rename_collection(self, old_name: str, new_name: str) -> bool:
         """Rename an existing KB collection without overwriting another one."""
@@ -246,8 +305,11 @@ class MilvusService:
             return True
         if utility.has_collection(new_name):
             raise ValueError("目标知识库向量集合已存在，不能覆盖")
-        if utility.has_collection(old_name):
-            utility.rename_collection(old_name, new_name)
+        try:
+            if utility.has_collection(old_name):
+                utility.rename_collection(old_name, new_name)
+        finally:
+            self._keyword_cache.invalidate(old_name, new_name)
         return True
 
     def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:

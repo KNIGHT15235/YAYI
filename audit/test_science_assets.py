@@ -249,6 +249,36 @@ class AssetDatabaseTests(unittest.TestCase):
                 retrieve_from_knowledge_base("science", "Method A", user_id=str(self.owner.id), knowledge_base_id=str(uuid4()))
             self.assertEqual(search.call_count, before)
 
+    def test_keyword_only_recall_keeps_exact_asset_identity_and_owner_checks(self):
+        from service import retrieval_service
+        from service.bm25_service import HybridConfig
+        from unittest.mock import MagicMock
+        result = self.add_assets(self.first)
+        chunk_id = result["provenance"][0]["chunk_id"]
+        hit = {"id": chunk_id, "doc_id": str(self.first.id), "filename": "same.pdf",
+               "content": "Method A: 91", "score": None, "bm25_score": 2}
+        service = MagicMock()
+        service.search.return_value = []
+        service.search_keyword.return_value = [hit]
+        with patch("core.database.SessionLocal", side_effect=lambda: nullcontext(self.db)), \
+                patch.object(retrieval_service, "get_milvus_service", return_value=service), \
+                patch.object(retrieval_service.HybridConfig, "from_env", return_value=HybridConfig()), \
+                patch.object(retrieval_service, "generate_embedding", return_value=[[.1] * 1024]), \
+                patch.object(retrieval_service, "rerank_similarity", return_value=([.9], None)):
+            rows = retrieval_service.retrieve_from_knowledge_base("science", "Method A", user_id=str(self.owner.id))
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual((row["chunk_id"], row["document_id"], row["document_version"]),
+                             (chunk_id, str(self.first.id), "v1"))
+            self.assertEqual(row["evidence_id"], "ev_" + chunk_id)
+            self.assertEqual(row["locators"][0]["page"], 2)
+            self.assertTrue(row["assets"][0]["locator"]["table_rows"])
+            self.assertIsNone(row["score"])
+            before = service.search_keyword.call_count
+            with self.assertRaises(HTTPException):
+                retrieval_service.retrieve_from_knowledge_base("science", "Method A", user_id=str(self.other.id))
+            self.assertEqual(service.search_keyword.call_count, before)
+
     def test_asset_list_and_download_check_owner_and_document_binding(self):
         result = self.add_assets(self.first)
         identity = result["assets"][0]["asset_id"]

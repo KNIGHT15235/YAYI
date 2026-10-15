@@ -13,18 +13,39 @@ import math
 from contextlib import nullcontext
 from service.milvus_service import get_milvus_service
 from service.embedding_service import generate_embedding, rerank_similarity
+from service.bm25_service import HybridConfig, reciprocal_rank_fusion
 
 logger = logging.getLogger(__name__)
 
 
 def search_chunks(collection_name, question, top_k=10, kb_id=None, rerank=True):
-    """Top-K cosine candidates, optionally reranked; service failures stay explicit."""
+    """Independent dense + BM25 recall, RRF fusion, then the existing reranker."""
     top_k = max(1, min(int(top_k), 50))
+    config = HybridConfig.from_env()
     vectors = generate_embedding([question])
     if not vectors or not vectors[0] or len(vectors[0]) != 1024:
         raise ValueError("查询向量生成失败")
-    chunks = get_milvus_service().search(collection_name, vectors[0], top_k=top_k, kb_id=kb_id)
-    result = {"results": chunks, "reranked": False, "warning": None}
+    service = get_milvus_service()
+    candidate_k = max(top_k, config.candidates) if config.enabled else top_k
+    dense = service.search(collection_name, vectors[0], top_k=candidate_k, kb_id=kb_id)
+    chunks = dense
+    warnings = []
+    method = "vector"
+    if config.enabled:
+        try:
+            lexical = service.search_keyword(collection_name, question, top_k=candidate_k,
+                                             kb_id=kb_id, config=config)
+            chunks = reciprocal_rank_fusion(dense, lexical, config.rrf_k)
+            method = "hybrid"
+        except Exception as exc:
+            logger.warning("BM25 unavailable (%s); using vector recall", type(exc).__name__)
+            warnings.append("关键词检索暂不可用，已降级为向量检索")
+            # Match the previous vector-only candidate and rerank budget on failure.
+            chunks = dense[:top_k]
+    if method == "hybrid":
+        chunks = chunks[:max(top_k, config.rerank_candidates)]
+    result = {"results": chunks[:top_k], "reranked": False, "warning": "；".join(warnings) or None,
+              "retrieval_method": method}
     if not rerank or not chunks:
         return result
     try:
@@ -33,11 +54,13 @@ def search_chunks(collection_name, question, top_k=10, kb_id=None, rerank=True):
             raise ValueError("重排分数缺失")
         result["results"] = sorted(
             [{**row, "rerank_score": float(score)} for row, score in zip(chunks, scores)],
-            key=lambda row: row["rerank_score"], reverse=True)
+            key=lambda row: row["rerank_score"], reverse=True)[:top_k]
         result["reranked"] = True
     except Exception as exc:
-        logger.warning("Rerank unavailable (%s); preserving cosine results", type(exc).__name__)
-        result["warning"] = "重排服务暂不可用，已按向量相似度返回结果"
+        logger.warning("Rerank unavailable (%s); preserving %s results", type(exc).__name__, method)
+        warnings.append("重排服务暂不可用，已按混合召回排序返回结果" if method == "hybrid"
+                        else "重排服务暂不可用，已按向量相似度返回结果")
+        result["warning"] = "；".join(warnings)
     return result
 
 

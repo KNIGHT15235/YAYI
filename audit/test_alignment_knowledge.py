@@ -23,17 +23,19 @@ class AlignmentKnowledgeTests(unittest.TestCase):
              patch.object(retrieval_service, 'get_milvus_service') as milvus, \
              patch.object(retrieval_service, 'rerank_similarity', return_value=([.1, .99], None)):
             milvus.return_value.search.return_value = chunks
+            milvus.return_value.search_keyword.return_value = []
             result = retrieval_service.search_chunks('kb_test', 'question')
             self.assertTrue(result['reranked'])
             self.assertEqual(result['results'][0]['id'], 'b')
             self.assertEqual(result['results'][0]['score'], .8)
-            self.assertEqual(milvus.return_value.search.call_args.kwargs['top_k'], 10)
+            self.assertEqual(milvus.return_value.search.call_args.kwargs['top_k'], 50)
 
     def test_rerank_failure_is_visible_without_losing_results(self):
         with patch.object(retrieval_service, 'generate_embedding', return_value=[[.1] * 1024]), \
              patch.object(retrieval_service, 'get_milvus_service') as milvus, \
              patch.object(retrieval_service, 'rerank_similarity', side_effect=RuntimeError('quota')):
             milvus.return_value.search.return_value = [{'id': 'a', 'content': 'answer', 'score': .9}]
+            milvus.return_value.search_keyword.return_value = []
             result = retrieval_service.search_chunks('kb_test', 'question')
             self.assertFalse(result['reranked'])
             self.assertTrue(result['warning'])

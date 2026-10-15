@@ -42,6 +42,7 @@ if __name__ == "__main__":
         "test_workflow_improvements", "test_runtime_improvements", "test_evidence_improvements",
         "test_runtime_configuration",
         "test_agent_request_configuration",
+        "test_hybrid_retrieval",
         "test_science_engine", "test_science_assets", "test_science_recursion",
         "test_scout_hypothesis_stage", "test_review_only_pipeline",
         "test_research_regressions", "test_research_error_checkpoint", "test_docmind_result_shapes",
