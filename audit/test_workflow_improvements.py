@@ -5,7 +5,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from test_science_engine import fixture_state, add_papers, paper, agent
+from test_science_engine import fixture_state, add_papers, paper, agent, review_result
 from service.deep_research_v2.evidence import normalize_paragraph, register_evidence
 from service.deep_research_v2.science_roles import (
     analyze_science, scout_science, review_science, write_science, plan_science,
@@ -29,7 +29,7 @@ def draft(state):
 
 
 def review_response(row, status="supported"):
-    return {"results": [{"claim_id": row["claim_id"], "status": status, "reason": "fixture evidence check"}],
+    return {"results": [review_result(row, status)],
             "critical_gaps": [], "search_tasks": []}
 
 
@@ -45,8 +45,7 @@ class DualLoopTests(unittest.IsolatedAsyncioTestCase):
         async def response(_agent, prompt, **kwargs):
             if "逐条审核" in prompt:
                 captured.append(prompt)
-                return {"results": [{"claim_id": claim["claim_id"], "status": "unverified",
-                                      "reason": "fixture: cannot complete semantic review"}]}
+                return {"results": [review_result(claim, "unverified", "fixture: cannot complete semantic review")]}
             return {"critical_gaps": [], "search_tasks": []}
 
         with patch(ROLE + ".json_call", side_effect=response):

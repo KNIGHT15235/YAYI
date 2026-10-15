@@ -22,6 +22,7 @@ from service.deep_research_v2.science_roles import (assess_evidence, corpus_anal
 from service.deep_research_v2.state import create_initial_state
 from service.deep_research_v2.graph import DeepResearchGraph
 from service.deep_research_v2.agents.critic import CriticMaster
+from service.deep_research_v2.manual_review import initialize_manual_review
 from router.research_router import ResumeResearchRequest, _prepare_bounded_recheck, resume_research
 research_router_module = importlib.import_module("router.research_router")
 
@@ -54,6 +55,13 @@ def agent():
     result._weighted_score = CriticMaster._weighted_score
     result.SCORE_WEIGHTS = CriticMaster.SCORE_WEIGHTS
     return result
+
+
+def review_result(claim, status="supported", reason="fixture evidence check"):
+    relation = {"supported": "supports", "contradicted": "contradicts", "insufficient": "insufficient", "unverified": "insufficient"}[status]
+    return {"claim_id": claim["claim_id"], "status": status, "reason": reason,
+            "reason_code": "semantic_uncertain" if status == "unverified" else "content_checked",
+            "evidence_checks": [{"evidence_id": eid, "relation": relation, "reason": reason} for eid in claim["evidence_ids"]]}
 
 
 class EvidenceTests(unittest.TestCase):
@@ -265,6 +273,7 @@ class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
         state.update(claims=claims, science_sections=[{"id": "sec_1", "title": "方法"}],
                      hypotheses=[{"id": "hyp_1", "content": "比较不同路线", "status": "supported", "reason": "待纠正的谱系外推", "evidence_ids": [eid]}],
                      manual_review_request={"notes": "全局核对谱系、年份与作者限定，包括假设理由", "claim_ids": [], "applied": False})
+        initialize_manual_review(state, state["manual_review_request"], new_request=True)
         responses = [{"revisions": [{"claim_id": claims[i]["claim_id"], "text": "模型基于证据修订" + str(i), "evidence_ids": [eid]} for i in range(3)]},
                      {"hypotheses": [{"id": "hyp_1", "status": "insufficient", "reason": "来源未支持该谱系关系", "evidence_ids": [eid],
                                        "evidence_checks": [{"evidence_id": eid, "year": 2020, "method": "siamese network", "relation": "contradicts"}]}]}]
@@ -304,6 +313,7 @@ class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
         claim["verification_status"] = "supported"
         state.update(claims=[claim], science_sections=[{"id": "sec_1", "title": "方法"}],
                      manual_review_request={"notes": "收窄为样本年代", "claim_ids": [claim["claim_id"]], "applied": False})
+        initialize_manual_review(state, state["manual_review_request"], new_request=True)
         response = {"revisions": [{"claim_id": claim["claim_id"], "text": claim["claim_text"], "evidence_ids": [eid]}]}
         with patch("service.deep_research_v2.science_roles.json_call", new_callable=AsyncMock, return_value=response):
             await revise_science(agent(), state)
@@ -380,8 +390,8 @@ class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
         state["claims"] = [normalize_paragraph(state, "本综述范围为2020–2026年。", [eid], "sec_1", 0),
                            normalize_paragraph(state, "该模型将F1提升20%。", [eid], "sec_1", 1)]
         state["claims"][0].update(verification_status="insufficient", reason="OLD_ANCHOR_REASON")
-        rows = [{"claim_id": state["claims"][0]["claim_id"], "status": "supported", "reason": "与用户限定范围一致"},
-                {"claim_id": state["claims"][1]["claim_id"], "status": "insufficient", "reason": "摘要未给出20%结果"}]
+        rows = [review_result(state["claims"][0], "supported", "与用户限定范围一致"),
+                review_result(state["claims"][1], "insufficient", "摘要未给出20%结果")]
         with patch("service.deep_research_v2.science_roles.json_call", new_callable=AsyncMock,
                    return_value={"results": rows, "critical_gaps": [], "search_tasks": []}) as call:
             await review_science(agent(), state)
@@ -409,7 +419,7 @@ class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
         state["claims"] = [claim]
         fake = agent()
         fake.call_llm = AsyncMock(side_effect=["invalid-json", json.dumps({"results": [
-            {"claim_id": claim["claim_id"], "status": "supported", "reason": "忠实转述已给摘要"}]}),
+            review_result(claim, "supported", "忠实转述已给摘要")]}),
             json.dumps({"critical_gaps": [], "search_tasks": []})])
         fake.parse_json_response.side_effect = json.loads
         await review_science(fake, state)
@@ -481,7 +491,7 @@ class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
         with patch("service.deep_research_v2.science_roles.json_call", new_callable=AsyncMock,
                    return_value={"results": [], "critical_gaps": [], "search_tasks": []}) as call:
             await review_science(agent(), state)
-        self.assertEqual(call.await_count, 4)  # Three claim batches plus independent task coverage.
+        self.assertEqual(call.await_count, 7)  # Three claim batches + one bounded targeted retry each + coverage.
         self.assertEqual(state["claim_verification"]["total"], 11)
         self.assertEqual(state["claim_verification"]["unverified"], 11)
         self.assertIsNone(state["quality_score"])

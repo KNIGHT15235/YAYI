@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_science_engine import fixture_state, paper, add_papers, agent
+from test_science_engine import fixture_state, paper, add_papers, agent, review_result
 from service.deep_research_v2.evidence import normalize_paragraph, register_evidence
 from service.deep_research_v2.graph import DeepResearchGraph
 from service.deep_research_v2.science_roles import (analyze_science, assess_evidence, review_science, scout_science,
@@ -30,8 +30,8 @@ def claim(state, text="作者提出孪生卷积网络。", index=0):
 
 
 def response(row, status="supported", **extra):
-    return {"results": [{"claim_id": row["claim_id"], "status": status,
-                         "reason": "摘要直接支持方法描述" if status == "supported" else "摘要没有所声称的对比实验数值"}],
+    return {"results": [review_result(row, status,
+                         "摘要直接支持方法描述" if status == "supported" else "摘要没有所声称的对比实验数值")],
             "critical_gaps": [], "search_tasks": [], **extra}
 
 

@@ -23,6 +23,7 @@ from service.knowledge_access import resolve_owned_knowledge_base
 from service.research_access import authorize_research_session
 from service.research_guard import ResearchLease
 from config.research_profiles import get_research_profile
+from service.deep_research_v2.manual_review import initialize_manual_review
 
 logger = logging.getLogger("ResearchRouter")
 router = APIRouter(prefix="/research", tags=["research"])
@@ -111,6 +112,7 @@ def _prepare_bounded_recheck(full, request):
         state.update(manual_review_request={"notes": notes, "claim_ids": review_ids, "applied": False,
                                             "requested_at": requested_at},
                      phase="revising", _next_step="revising", iteration=int(state.get("iteration", 0)) + 1)
+        initialize_manual_review(state, state["manual_review_request"], new_request=True)
     # Existing claims/scores remain as recorded until the real Critic reruns.
     return state, True
 

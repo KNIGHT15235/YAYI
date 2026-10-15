@@ -123,6 +123,8 @@ class ResearchState(TypedDict):
     supplementary_origin: Optional[str]
     return_phase: str
     claim_verification: Dict[str, Any]
+    review_contract_audit: List[Dict[str, Any]] # Bounded actual reviewer-input/contract attempt summaries
+    manual_review_request: Dict[str, Any]     # Frozen edit baselines; application and verification are independent
     corpus_statistics: Dict[str, Any]
     citation_errors: List[Dict[str, Any]]
     literature_errors: List[Dict[str, Any]]

@@ -12,6 +12,8 @@ from collections import Counter
 from .evidence import (ensure_science_state, register_evidence, stable_id,
                        normalize_paragraph, references_from_ledger, render_claim,
                        render_science_report, validate_citations, research_sources, evidence_quote_candidates)
+from .review_quality import build_review_materials, validate_review_response, REVIEW_CONTRACT_VERSION
+from .manual_review import initialize_manual_review, update_manual_progress
 
 SCIENCE_SYSTEM = (
     "你是严谨的科研文献助手。只依据提供的真实来源，明确区分摘要、全文、元数据与推断。"
@@ -712,6 +714,12 @@ evidence_links仅填写证据中真实存在的位置，不能猜页码、表格
 
 async def review_hypotheses_with_notes(agent, state, manual):
     hypotheses = state.get("hypotheses") or []
+    frozen_ids = manual.get("hypothesis_ids")
+    if frozen_ids is not None:
+        hypotheses = [h for h in hypotheses if h.get("id") in frozen_ids]
+        if len(hypotheses) != len(frozen_ids) or len({h.get("id") for h in hypotheses}) != len(frozen_ids):
+            manual["hypothesis_review_status"] = "unconfirmed"
+            return False
     if not hypotheses:
         manual["hypothesis_review_status"] = "not_needed"
         return True
@@ -763,7 +771,8 @@ status为 supported/contradicted/mixed/insufficient；每条必须有具体依�
                               evidence=evidence_ids, evidence_ids=evidence_ids,
                               background_evidence_ids=backgrounds, evidence_checks=list(checks.values()))
         manual["hypothesis_review_status"] = "confirmed" if complete else "unconfirmed"
-        agent.add_message(state, "hypotheses", {"hypotheses": hypotheses, "review_origin": "manual_followup"})
+        agent.add_message(state, "hypotheses", {"hypotheses": state.get("hypotheses", []),
+                          "reviewed_hypothesis_ids": [h["id"] for h in hypotheses], "review_origin": "manual_followup"})
         return complete
     except Exception as exc:
         manual["hypothesis_review_status"] = "unconfirmed"
@@ -774,10 +783,14 @@ status为 supported/contradicted/mixed/insufficient；每条必须有具体依�
 
 async def revise_science(agent, state):
     manual = state.get("manual_review_request") or {}
+    if manual.get("notes"):
+        initialize_manual_review(state, manual)
+        update_manual_progress(state, manual)
     manual_active = bool(manual.get("notes") and not manual.get("applied"))
     requested_ids = set(manual.get("claim_ids") or [])
+    manual_target_ids = set(manual.get("target_claim_ids") or [])
     problems = [c for c in state["claims"] if c.get("verification_status") in ("contradicted", "insufficient", "unverified")
-                or (manual_active and (not requested_ids or c["claim_id"] in requested_ids))]
+                or (manual_active and c["claim_id"] in manual_target_ids)]
     coverage_requests = state.get("review_revision_requests") or []
     if not problems and not coverage_requests:
         state["phase"] = "reviewing"
@@ -801,8 +814,17 @@ evidence_link_errors.rejected记录上次失败引用；不要重复拼写其中
     if manual_active:
         # The repair batch also contains automatic citation failures. Explicitly
         # bind "selected claims" in the user's notes to IDs, not that whole batch.
-        manual_targets = [{"claim_id": c["claim_id"], "original_text": c["claim_text"]}
-                          for c in problems if not requested_ids or c["claim_id"] in requested_ids]
+        baseline = {row["claim_id"]: row for row in manual.get("targets", [])}
+        manual_targets = []
+        for claim in problems:
+            cid = claim["claim_id"]
+            if cid not in manual_target_ids:
+                continue
+            original = baseline.get(cid, {}).get("baseline_text") or claim["claim_text"]
+            target = {"claim_id": cid, "original_text": original}
+            if original != claim["claim_text"]:
+                target["current_text"] = claim["claim_text"]
+            manual_targets.append(target)
         manual_request = {"scope": "selected_claims" if requested_ids else "all_claims",
                           "target_claim_ids": [c["claim_id"] for c in manual_targets],
                           "targets": manual_targets, "review_notes": manual["notes"]}
@@ -813,7 +835,6 @@ evidence_link_errors.rejected记录上次失败引用；不要重复拼写其中
                    "人工意见不是新文献证据；一切修改仍须依原始证据，不支持时明确限定或说明未知。"
                    "年份样本证据只能写该年份已有工作，不能保留缺乏起源依据的‘在某年后被引入’。")
     revised_ids = set()
-    changed_ids = set()
     try:
         result = await json_call(agent, prompt, max_tokens=14000, use_cache=False)
         allowed_ids = {c["claim_id"] for c in problems}
@@ -825,8 +846,6 @@ evidence_link_errors.rejected记录上次失败引用；不要重复拼写其中
             replacement = normalize_paragraph(state, edit["text"], edit.get("evidence_ids"), claim["section_id"], ordinal,
                                               evidence_links=edit.get("evidence_links"))
             replacement["claim_id"] = claim["claim_id"]
-            if replacement["claim_text"] != claim["claim_text"]:
-                changed_ids.add(claim["claim_id"])
             claim.clear()
             claim.update(replacement)
             revised_ids.add(claim["claim_id"])
@@ -850,14 +869,11 @@ evidence_link_errors.rejected记录上次失败引用；不要重复拼写其中
             # A claim-scoped edit does not authorize a separate, full-hypothesis
             # revision. The ordinary Reviewer still gates the final report.
             manual["hypothesis_review_status"] = "not_requested"
-            hypothesis_done = True
         else:
-            hypothesis_done = await review_hypotheses_with_notes(agent, state, manual)
-        manual["applied"] = (hypothesis_done and all(c["claim_id"] in revised_ids for c in problems)
-                             and all(cid in changed_ids for cid in requested_ids))
-        manual["revised_claim_ids"] = sorted(revised_ids)
-        manual["changed_claim_ids"] = sorted(changed_ids)
-        manual["unchanged_requested_claim_ids"] = sorted(requested_ids - changed_ids)
+            manual["hypothesis_review_status"] = "pending"
+            await review_hypotheses_with_notes(agent, state, manual)
+    if manual.get("notes"):
+        update_manual_progress(state, manual, revised_ids=revised_ids)
     render_science_report(state)
     for section in state["science_sections"]:
         state["draft_sections"][section["id"]] = "\n\n".join(render_claim(state, c) for c in state["claims"] if c["section_id"] == section["id"])
@@ -1029,6 +1045,10 @@ def authorize_review_search(agent, state, tasks):
 
 async def review_science(agent, state):
     ensure_science_state(state)
+    manual = state.get("manual_review_request") or {}
+    if manual.get("notes"):
+        initialize_manual_review(state, manual)
+        update_manual_progress(state, manual)
     assessment = refresh_review_assessment(state)
     if not state.get("claims"):
         emit_step(agent, state, "reviewing", "科研证据预审")
@@ -1066,6 +1086,7 @@ async def review_science(agent, state):
         ids = list(dict.fromkeys(i for c in pending for i in c.get("evidence_ids", [])))
         # No report-prefix truncation: every authored paragraph is checked.
         # Source excerpts are explicit; missing details yield insufficient.
+        materials = build_review_materials(evidence_input(state, ids, limit=12000))
         prompt = """逐条审核下面科研段落是否被其引用的原始证据直接支持，不能使用外部常识补足。
 证据对象的 text 是本次已经提供的原始摘要或正文片段，必须实际阅读并核对；evidence_level=abstract 不等于只有元数据。
 evidence_links 中 chunk_only 只表示定位精度停留在片段级，缺少 quote/locator 不等于缺少 text；quote_candidates 只是原文定位摘录，不是阅读 text 的前置条件。
@@ -1077,7 +1098,7 @@ evidence_links 中 chunk_only 只表示定位精度停留在片段级，缺少 q
 supported=全部实质内容被证据支持或诚实界定资料缺口；contradicted=与证据明确冲突；
 insufficient=包含证据未支持的细节、过度外推或不恰当跨实验比较；unverified=无法完成核验。
 解释reason具体指出支持或缺失的原文。证据是摘要时不能假定正文还包含某数据。
-逐项检查evidence_links的quote、locator、表格行/公式/资产是否真正支持claim，位置存在本身不等于语义支持。
+引用身份和原文位置已由服务端独立校验；此处必须阅读提供的原文判断支持关系，不以定位标签判断是否有原文。
 assets中hydration=partial/unavailable表示未返回的行或全文尚未读取；visual_unverified图像只提供caption，不能据此核验图内数值。
 assets_omitted_for_budget表示资产未提供，不能推断其中内容；verification=validated只表示位置通过校验，不等于语义已支持。
 不得要求本来未声明的实验数字，不因表达真实研究建议或诚实局限而制造错误。
@@ -1095,24 +1116,58 @@ assets_omitted_for_budget表示资产未提供，不能推断其中内容；veri
    但建议夹带的外部事实、性能提升或已完成实验仍必须有证据，不能仅用“建议”字样豁免事实。
 3. 论文方法、实验数字、模型优劣、因果或泛化结论，只能依据该段引用证据逐项核对；任务范围与统计不能支持这些断言。
 若一段混合三类内容，只有所有实质判断各自有对应依据或明确保留为未知才能 supported。
-输出JSON：{"results":[{"claim_id":"...","status":"supported|contradicted|insufficient|unverified","reason":"逐项核查依据"}]}。
+此处仅提供原文材料与服务端availability，作者的引用定位标签已独立校验，不参与判断原文是否可读。
+对每个evidence_id逐一输出evidence_checks，relation为supports/contradicts/insufficient/unreadable；availability.content_available=true时不可说没有原文，无法理解应为semantic_uncertain而非content_unavailable。
+每条claim必须输出其全部evidence_ids的check，不能添加其他ID；supported至少有直接supports且所有实质子断言均被支持，contradicted至少有明确contradicts。
+reason_code=content_checked表示已读原文并完成支撑/冲突/不足判断；content_unavailable仅限所引原文确实未提供；semantic_uncertain表示虽有原文仍无法完成语义判断。
+可选quote必须为当前呈现text或资产context_text中的连续逐字原文；不要制造摘录。
+“本次未检得”不证明领域不存在；即使检索了多篇论文也不能推断所有真实研究均未报告某结果。请将这类断言判insufficient并建议限定本次语料。
+输出JSON：{"results":[{"claim_id":"...","status":"supported|contradicted|insufficient|unverified","reason":"逐项核查依据","reason_code":"content_checked|content_unavailable|semantic_uncertain","evidence_checks":[{"evidence_id":"...","relation":"supports|contradicts|insufficient|unreadable","reason":"依据当前材料的实际判定"}]}]}。
 必须每条claim恰好输出一次，不输出总分。
 任务范围与服务端统计：""" + json.dumps(review_context(state), ensure_ascii=False) + "\n段落：" + json.dumps(
-            [{key: c.get(key) for key in ("claim_id", "section_id", "claim_text", "evidence_ids", "evidence_links")} for c in pending], ensure_ascii=False
-        ) + "\n证据：" + json.dumps(evidence_input(state, ids, limit=12000), ensure_ascii=False)
-        try:
-            async with semaphore:
-                response = await json_call(agent, prompt, max_tokens=7000, retries=1, use_cache=False)
-            rows = response.get("results", [])
-            mapping = {r.get("claim_id"): r for r in rows if isinstance(r, dict)}
-            for claim in pending:
-                row = mapping.get(claim["claim_id"], {})
-                status = row.get("status")
-                if status not in {"supported", "contradicted", "insufficient", "unverified"} or not str(row.get("reason", "")).strip():
-                    row = {"claim_id": claim["claim_id"], "status": "unverified", "reason": "审核返回不完整或无效，未当作通过"}
-                results.append({"claim_id": claim["claim_id"], "status": row["status"], "reason": str(row["reason"])})
-        except Exception as exc:
-            results.extend({"claim_id": c["claim_id"], "status": "unverified", "reason": f"审核调用失败: {type(exc).__name__}"} for c in pending)
+            [{key: c.get(key) for key in ("claim_id", "section_id", "claim_text", "evidence_ids")} for c in pending], ensure_ascii=False
+        )
+        header = prompt.split("\n段落：", 1)[0]
+        def build_prompt(items, errors=None):
+            current = header
+            target_ids = {c["claim_id"] for c in items} & set(manual.get("target_claim_ids") or [])
+            if manual.get("notes") and target_ids:
+                current += ("\n人工指出的待解决问题（不构成文献证据）：" + json.dumps({
+                    "notes": manual["notes"], "targets": [row for row in manual.get("targets", []) if row["claim_id"] in target_ids]}, ensure_ascii=False)
+                    + "\n结合原始证据核对当前段落是否已解决上述具体问题；仅正文发生变化不表示问题已解决，尚未解决时判insufficient。")
+            current += "\n段落：" + json.dumps([{key: c.get(key) for key in ("claim_id", "section_id", "claim_text", "evidence_ids")} for c in items], ensure_ascii=False)
+            if errors:
+                current += "\n契约错误（请读服务端availability并重核原文，不得为了修复契约直接改supported）：" + json.dumps(errors, ensure_ascii=False)
+            required_ids = {eid for claim in items for eid in claim.get("evidence_ids", [])}
+            return current + "\n证据：" + json.dumps([m for m in materials if m["evidence_id"] in required_ids], ensure_ascii=False)
+        prompt = build_prompt(pending)
+        remaining = pending
+        attempts = []
+        for attempt in range(2):
+            try:
+                async with semaphore:
+                    response = await json_call(agent, prompt, max_tokens=9000, retries=0, use_cache=False)
+                accepted, violations = validate_review_response(response, remaining, materials)
+            except Exception as exc:
+                accepted, violations = [], {c["claim_id"]: ["call_failed_" + type(exc).__name__] for c in remaining}
+            results.extend(accepted)
+            attempts.append({"attempt": attempt + 1, "claim_ids": [c["claim_id"] for c in remaining], "violations": violations})
+            if not violations:
+                break
+            remaining = [c for c in remaining if c["claim_id"] in violations]
+            if attempt == 0:
+                # Retry only contract-invalid rows; valid semantic failures are
+                # already complete and must not be retried until they pass.
+                prompt = build_prompt(remaining, violations)
+            else:
+                results.extend({"claim_id": c["claim_id"], "status": "unverified", "reason_code": "contract_error",
+                                "reason": "审核契约复验仍不合法，未作质量通过：" + ", ".join(violations[c["claim_id"]]),
+                                "review_contract_version": REVIEW_CONTRACT_VERSION, "contract_errors": violations[c["claim_id"]]}
+                               for c in remaining)
+        state.setdefault("review_contract_audit", []).append({"version": REVIEW_CONTRACT_VERSION,
+            "iteration": state.get("iteration", 0), "attempts": attempts,
+            "availability": {m["evidence_id"]: m["availability"] for m in materials}})
+        state["review_contract_audit"] = state["review_contract_audit"][-100:]
         agent.add_message(state, "claim_review_progress", {"results": results, "total": len(claims)})
         return results
 
@@ -1123,6 +1178,11 @@ assets_omitted_for_budget表示资产未提供，不能推断其中内容；veri
         result = mapping.get(claim["claim_id"], {"status": "unverified", "reason": "没有核验结果"})
         claim["verification_status"] = result["status"]
         claim["reason"] = result["reason"]
+        claim["review_details"] = {key: result[key] for key in ("reason_code", "evidence_checks", "review_contract_version", "scope_errors", "contract_errors") if key in result}
+    manual = state.get("manual_review_request") or {}
+    if manual.get("notes"):
+        initialize_manual_review(state, manual)
+        update_manual_progress(state, manual)
     counts = Counter(c["verification_status"] for c in claims)
     checked = len(claims) - counts["unverified"] - counts["pending"]
     verification = {"total": len(claims), "checked": checked, "skipped": len(claims) - checked,
@@ -1165,7 +1225,8 @@ assets_omitted_for_budget表示资产未提供，不能推断其中内容；veri
                       "dimension_scores": dimensions, "score_weights": agent.SCORE_WEIGHTS,
                       "quality_review_status": state["quality_review_status"], "issues_count": len(issues),
                       "major_issues": len(issues), "summary": f"逐条核验 {checked}/{len(claims)}；支持 {counts['supported']}，待处理 {len(issues)}。",
-                      "quality_review_note": state["quality_review_note"], "claim_verification": verification})
+                      "quality_review_note": state["quality_review_note"], "claim_verification": verification,
+                      "manual_review": {key: manual.get(key) for key in ("applied", "text_applied", "application_status", "verification_status", "changed_claim_ids", "unchanged_requested_claim_ids")} if manual.get("notes") else None})
     if passed:
         state["phase"] = "completed"
         set_research_outcome(state, "passed", "pass", "quality_passed")

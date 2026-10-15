@@ -16,6 +16,7 @@ from service.deep_research_v2.evidence import (
     evidence_quote_candidates,
 )
 from service.deep_research_v2.science_roles import evidence_input, revise_science
+from service.deep_research_v2.manual_review import initialize_manual_review
 
 
 def local_row(chunk="chunk1", **changes):
@@ -361,6 +362,7 @@ class QuoteRepairTests(unittest.IsolatedAsyncioTestCase):
         state["claims"] = [target, other]
         note = "收窄所选声明的年代范围，不能把样本年份当作起源。"
         state["manual_review_request"] = {"notes": note, "claim_ids": [target["claim_id"]], "applied": False}
+        initialize_manual_review(state, state["manual_review_request"], new_request=True)
         candidate = evidence_quote_candidates(row)[0]
         # Both citations are repaired but the requested target body is unchanged.
         response = {"revisions": [{"claim_id": claim["claim_id"], "text": claim["claim_text"],
@@ -402,6 +404,7 @@ class QuoteRepairTests(unittest.IsolatedAsyncioTestCase):
         original_hypotheses, original_other = copy.deepcopy(state["hypotheses"]), copy.deepcopy(other)
         state["manual_review_request"] = {"notes": "Only narrow the selected statement.",
             "claim_ids": [target["claim_id"]], "applied": False, "hypothesis_review_status": "unconfirmed"}
+        initialize_manual_review(state, state["manual_review_request"], new_request=True)
         response = {"revisions": [{"claim_id": target["claim_id"], "text": "A narrowed claim under the reported setup.",
                                    "evidence_ids": [row["evidence_id"]]}]}
         agent = SimpleNamespace(add_message=lambda *args, **kwargs: None)
@@ -430,6 +433,7 @@ class QuoteRepairTests(unittest.IsolatedAsyncioTestCase):
         state["claims"] = [claim]
         state["hypotheses"] = [{"id": "hyp_1", "content": "Global hypothesis", "evidence_ids": [row["evidence_id"]]}]
         state["manual_review_request"] = {"notes": "Review the whole report and hypotheses.", "claim_ids": [], "applied": False}
+        initialize_manual_review(state, state["manual_review_request"], new_request=True)
         response = {"revisions": [{"claim_id": claim["claim_id"], "text": "Revised statement.", "evidence_ids": [row["evidence_id"]]}]}
         agent = SimpleNamespace(add_message=lambda *args, **kwargs: None)
         with patch("service.deep_research_v2.science_roles.json_call", new_callable=AsyncMock,
@@ -450,6 +454,7 @@ class QuoteRepairTests(unittest.IsolatedAsyncioTestCase):
         for claim in state["claims"]:
             claim["verification_status"] = "supported"
         state["manual_review_request"] = {"notes": "逐段补充适用条件。", "claim_ids": [], "applied": False}
+        initialize_manual_review(state, state["manual_review_request"], new_request=True)
         agent = SimpleNamespace(add_message=lambda *args, **kwargs: None)
         with patch("service.deep_research_v2.science_roles.json_call", new_callable=AsyncMock,
                    return_value={"revisions": []}) as call:
