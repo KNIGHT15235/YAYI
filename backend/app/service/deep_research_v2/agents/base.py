@@ -17,6 +17,7 @@ from openai import OpenAI
 
 from ..state import ResearchState, AgentLog
 from service.response_cache import RedisJSONCache
+from config.llm_config import get_config
 
 llm_cache = RedisJSONCache("research-llm-v1", 3600)
 
@@ -36,11 +37,13 @@ class BaseAgent(ABC):
         role: str,
         llm_api_key: str,
         llm_base_url: str,
-        model: str = "qwen-max"
+        model: Optional[str] = None,
+        config_key: str = "",
     ):
         self.name = name
         self.role = role
-        self.model = model
+        self.model_config = get_config().get_agent_config(config_key)
+        self.model = model or self.model_config.model
         self.client = OpenAI(api_key=llm_api_key, base_url=llm_base_url)
         self.cache_scope = None  # Only authenticated research enables shared caching.
         self._cache_credential = hashlib.sha256(llm_api_key.encode()).hexdigest()
@@ -65,9 +68,10 @@ class BaseAgent(ABC):
         system_prompt: str,
         user_prompt: str,
         json_mode: bool = True,
-        temperature: float = 0.3,
-        max_tokens: int = 16000,  # 拉满到最大值
-        use_cache: bool = True
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        use_cache: bool = True,
+        stage: Optional[str] = None,
     ) -> str:
         """
         调用 LLM
@@ -76,9 +80,10 @@ class BaseAgent(ABC):
             system_prompt: 系统提示
             user_prompt: 用户提示
             json_mode: 是否强制JSON输出
-            temperature: 温度参数
-            max_tokens: 最大token数
+            temperature: 显式覆盖温度；省略时采用角色/阶段配置
+            max_tokens: 输出额度上限；省略时采用角色配置
             use_cache: 是否允许读取/写入共享响应缓存；需要业务校验的审核响应禁用
+            stage: supplementary（补检）或 revision（定向修订）
 
         Returns:
             LLM 响应文本
@@ -92,8 +97,8 @@ class BaseAgent(ABC):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                "temperature": temperature,
-                "max_tokens": max_tokens
+                "temperature": self.model_config.temperature_for(stage) if temperature is None else temperature,
+                "max_tokens": self.model_config.max_tokens if max_tokens is None else max_tokens
             }
 
             if json_mode:

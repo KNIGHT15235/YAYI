@@ -247,14 +247,15 @@ URL: {url}
         llm_api_key: str,
         llm_base_url: str,
         search_api_key: str,
-        model: str = "qwen-plus"
+        model: str = None
     ):
         super().__init__(
             name="DeepScout",
             role="深度侦探",
             llm_api_key=llm_api_key,
             llm_base_url=llm_base_url,
-            model=model
+            model=model,
+            config_key="scout"
         )
         self.search_api_key = search_api_key
         self.fact_fingerprints: Dict[str, str] = {}  # 事实指纹用于去重
@@ -603,7 +604,7 @@ URL: {url}
             system_prompt="你是专业的信息提取专家，擅长从搜索结果中提取结构化信息。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
+            stage="supplementary",
         )
 
         return self.parse_json_response(response)
@@ -1105,7 +1106,6 @@ URL: {url}
             system_prompt="你是专业的信息验证专家，擅长从搜索结果中提取权威信息并追溯原始来源。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
         )
 
         return self.parse_json_response(response)
@@ -1275,7 +1275,6 @@ URL: {r.get('url', '')}
             system_prompt="你是专业的研究分析师，擅长从搜索结果中提取结构化信息、验证假设并评估来源质量。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
         )
 
         return self.parse_json_response(response)

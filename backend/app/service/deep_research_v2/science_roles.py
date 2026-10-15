@@ -27,13 +27,13 @@ def emit_step(agent, state, kind, title, status="running", **stats):
                       "title": title, "subtitle": title, "status": status, "stats": stats})
 
 
-async def json_call(agent, prompt, *, max_tokens=10000, temperature=.2, retries=1, use_cache=True):
+async def json_call(agent, prompt, *, max_tokens=None, temperature=None, retries=1, use_cache=True, stage=None):
     last = None
     for attempt in range(retries + 1):
         try:
             response = await asyncio.wait_for(agent.call_llm(
                 system_prompt=SCIENCE_SYSTEM, user_prompt=prompt, json_mode=True,
-                temperature=temperature, max_tokens=max_tokens, use_cache=use_cache and attempt == 0), timeout=240)
+                temperature=temperature, max_tokens=max_tokens, stage=stage, use_cache=use_cache and attempt == 0), timeout=240)
             result = agent.parse_json_response(response)
             if not isinstance(result, dict) or not result:
                 raise ValueError("模型没有返回可用 JSON 对象")
@@ -188,7 +188,7 @@ sections 共6项，至少覆盖范围与术语、方法分类、方法与证据�
 一般方法综述优先比较有来源的方法机制、适用条件和局限。数据/评价一章可描述已提供设置并说明缺口，不强制补齐 F1/IoU。
 研究问题：""" + state["query"] + "\n硬范围约束：" + json.dumps(research_scope(state["query"]), ensure_ascii=False)
     try:
-        result = await json_call(agent, prompt, max_tokens=4500)
+        result = await json_call(agent, prompt)
         sections = result.get("sections") or []
         if not 4 <= len(sections) <= 8 or any(not isinstance(s, dict) or not s.get("title") for s in sections):
             raise ValueError("无效研究大纲")
@@ -396,7 +396,7 @@ kind 仅为 topic_coverage（缺少明确要求的主题材料）或 required_co
 search_queries 与 description 分开：只给与缺口直接相关、适合公开文献搜索的短查询，不复制诊断段落，不包含内部 evidence_id/ev_ 标记或任务ID。
 用户问题：""" + state["query"] + "\n章节：" + json.dumps(state.get("outline", []), ensure_ascii=False) + "\n假设：" + json.dumps(state.get("hypotheses", []), ensure_ascii=False) + "\n证据：" + json.dumps(evidence_input(state, limit=900), ensure_ascii=False)
         try:
-            reflection = await json_call(agent, prompt, max_tokens=6500)
+            reflection = await json_call(agent, prompt)
             if not isinstance(reflection.get("critical_gaps"), list) or not isinstance(reflection.get("limitations", []), list):
                 raise ValueError("分析未返回有效的证据覆盖决策")
             state["analysis_semantic_status"] = "confirmed"
@@ -579,31 +579,79 @@ async def analyze_science(agent, state):
 
 
 async def visualize_science(agent, state):
-    emit_step(agent, state, "generating", "依据真实文献元数据生成统计图表")
+    emit_step(agent, state, "generating", "选择图表方案并依据真实文献元数据生成图表")
     stats = state.get("corpus_statistics", {})
-    charts = []
-    for chart_id, title, data, subtitle in [
+    datasets = [
         ("corpus_years", "纳入文献年份分布", stats.get("year_distribution", {}), "仅统计本次检索集；不是领域年度发文总量"),
         ("corpus_methods", "文献标题/摘要方法关键词分布", stats.get("method_mentions", {}), "关键词可重叠；不代表性能排名或主要方法分类"),
-    ]:
-        if not data:
-            continue
+    ]
+    datasets = [row for row in datasets if row[2]]
+    designs = {}
+    model = getattr(agent, "model", None)
+    plan = {"status": "no_data", "charts": [], "model": model if isinstance(model, str) else None}
+    if datasets:
+        prompt = (
+            "为以下已计算的文献统计选择展示方式。每个数据集必须输出一项，id原样保留。"
+            "corpus_years允许bar或line；corpus_methods只允许bar，因为关键词可重叠。"
+            "bar可选择vertical或horizontal；line只允许vertical。选择有助于阅读年份或较长类别标签的布局。"
+            "只选择类型与布局，不返回或修改数值、类别、标题、来源，不生成Python或JavaScript代码。"
+            '输出JSON：{"charts":[{"id":"corpus_years","type":"line","orientation":"vertical"}]}。'
+            "\n统计数据与口径：" + json.dumps(
+                [{"id": cid, "title": title, "data": data, "scope": subtitle}
+                 for cid, title, data, subtitle in datasets], ensure_ascii=False)
+        )
+        try:
+            result = await json_call(agent, prompt, retries=0)
+            rows = result.get("charts")
+            expected = {row[0] for row in datasets}
+            if not isinstance(rows, list) or len(rows) != len(expected):
+                raise ValueError("图表方案未覆盖全部数据集")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("图表方案必须是对象")
+                cid, kind, orientation = row.get("id"), row.get("type"), row.get("orientation")
+                if not isinstance(cid, str) or cid not in expected or cid in designs:
+                    raise ValueError("图表方案包含未知或重复数据集")
+                allowed_types = ("bar", "line") if cid == "corpus_years" else ("bar",)
+                if kind not in allowed_types or orientation not in ("vertical", "horizontal"):
+                    raise ValueError("图表类型或布局不受支持")
+                if kind == "line" and orientation != "vertical":
+                    raise ValueError("年份折线图必须采用纵向布局")
+                # Only copy validated presentation choices; never model-supplied data/code.
+                designs[cid] = {"id": cid, "type": kind, "orientation": orientation}
+            plan.update(status="model", charts=list(designs.values()))
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as exc:
+            designs = {}
+            plan.update(status="deterministic_fallback", error_type=type(exc).__name__)
+            agent.logger.warning("Chart design unavailable; using verified corpus bars: %s", type(exc).__name__)
+    charts = []
+    for chart_id, title, data, subtitle in datasets:
+        design = designs.get(chart_id, {"id": chart_id, "type": "bar", "orientation": "vertical"})
+        kind, horizontal = design["type"], design["orientation"] == "horizontal"
         labels, values = list(data), list(data.values())
+        category_axis = {"type": "category", "data": labels, "axisLabel": {"rotate": 0 if horizontal else 30, "interval": 0}}
+        value_axis = {"type": "value", "name": "篇", "minInterval": 1}
         option = {"title": {"text": title, "subtext": subtitle, "left": "center", "textStyle": {"fontSize": 16}},
-                  "tooltip": {"trigger": "axis"}, "grid": {"left": "8%", "right": "5%", "bottom": "24%", "top": 90},
-                  "xAxis": {"type": "category", "data": labels, "axisLabel": {"rotate": 30, "interval": 0}},
-                  "yAxis": {"type": "value", "name": "篇", "minInterval": 1},
-                  "series": [{"type": "bar", "data": values, "name": "文献数", "label": {"show": True, "position": "top"}}]}
-        charts.append({"id": chart_id, "title": title, "type": "bar", "echarts_option": option,
+                  "tooltip": {"trigger": "axis"}, "grid": {"left": "8%", "right": "5%", "bottom": "24%", "top": 90, "containLabel": True},
+                  "xAxis": value_axis if horizontal else category_axis,
+                  "yAxis": category_axis if horizontal else value_axis,
+                  "series": [{"type": kind, "data": values, "name": "文献数", "label": {"show": True, "position": "right" if horizontal else "top"}}]}
+        charts.append({"id": chart_id, "title": title, "type": kind, "echarts_option": option,
                        "description": subtitle, "data_source": "verified_literature_corpus", "data": dict(data),
                        "evidence_ids": [p["evidence_id"] for p in state.get("papers", [])]})
+    if plan["status"] == "deterministic_fallback":
+        plan["charts"] = [{"id": row[0], "type": "bar", "orientation": "vertical"} for row in datasets]
+    state["visualization_plan"] = plan
     state["charts"] = [c for c in state.get("charts", []) if c.get("id") not in {"corpus_years", "corpus_methods"}] + charts
     code = "Counter(str(p['year']) for p in papers if p.get('year'))  # actual verified metadata"
     state["code_executions"] = [{"id": "corpus_statistics", "language": "python", "code": code,
                                  "status": "success", "result": stats, "execution_mode": "deterministic_trusted_analysis"}]
     agent.add_message(state, "charts", {"charts": charts})
     agent.add_message(state, "code_result", {"success": True, "result": stats, "description": "文献元数据聚合，无生成实验数值"})
-    emit_step(agent, state, "generating", "文献统计图表已生成", "completed", charts_count=len(charts))
+    emit_step(agent, state, "generating", "文献统计图表已生成", "completed",
+              charts_count=len(charts), design_status=plan["status"])
     return state
 
 
@@ -659,7 +707,7 @@ evidence_links仅填写证据中真实存在的位置，不能猜页码、表格
         if previous:
             prompt += "\n前文已写观点（仅用于衔接，仍要对照证据）：" + json.dumps(previous, ensure_ascii=False)
         async with semaphore:
-            result = await json_call(agent, prompt, max_tokens=6000, temperature=.25)
+            result = await json_call(agent, prompt)
         paragraphs = result.get("paragraphs")
         if not isinstance(paragraphs, list):
             raise ValueError("章节没有返回结构化段落")
@@ -742,7 +790,7 @@ status为 supported/contradicted/mixed/insufficient；每条必须有具体依�
         [{"id": h["id"], "content": h.get("content", ""), "candidate_evidence_ids": h.get("evidence_ids") or h.get("evidence") or []} for h in hypotheses], ensure_ascii=False
     ) + "\n证据：" + json.dumps(evidence_input(state, ids or None, limit=2400), ensure_ascii=False)
     try:
-        result = await json_call(agent, prompt, max_tokens=6000, use_cache=False)
+        result = await json_call(agent, prompt, stage="revision", use_cache=False)
         rows = {r.get("id"): r for r in result.get("hypotheses", []) if isinstance(r, dict)}
         complete = True
         for hypothesis in hypotheses:
@@ -836,7 +884,7 @@ evidence_link_errors.rejected记录上次失败引用；不要重复拼写其中
                    "年份样本证据只能写该年份已有工作，不能保留缺乏起源依据的‘在某年后被引入’。")
     revised_ids = set()
     try:
-        result = await json_call(agent, prompt, max_tokens=14000, use_cache=False)
+        result = await json_call(agent, prompt, stage="revision", use_cache=False)
         allowed_ids = {c["claim_id"] for c in problems}
         edits = {r.get("claim_id"): r for r in result.get("revisions", []) if isinstance(r, dict) and r.get("claim_id") in allowed_ids}
         for ordinal, claim in enumerate(state["claims"]):
@@ -956,7 +1004,7 @@ query 为针对缺失证据的真实检索词，可追溯论文题名/DOI或查�
         prompt += "\n确定性语料覆盖：" + json.dumps(assessment, ensure_ascii=False)
         prompt += "\n可用来源：" + json.dumps(evidence_input(state, limit=500), ensure_ascii=False)
         try:
-            decision = await json_call(agent, prompt, max_tokens=4500, use_cache=False)
+            decision = await json_call(agent, prompt, use_cache=False)
             if not isinstance(decision.get("critical_gaps"), list) or not isinstance(decision.get("search_tasks"), list):
                 raise ValueError("任务覆盖审核未返回有效决策")
             gaps, limitations, searches = classify_research_gaps(decision, state["query"])
@@ -1146,7 +1194,7 @@ reason_code=content_checked表示已读原文并完成支撑/冲突/不足判断
         for attempt in range(2):
             try:
                 async with semaphore:
-                    response = await json_call(agent, prompt, max_tokens=9000, retries=0, use_cache=False)
+                    response = await json_call(agent, prompt, retries=0, use_cache=False)
                 accepted, violations = validate_review_response(response, remaining, materials)
             except Exception as exc:
                 accepted, violations = [], {c["claim_id"]: ["call_failed_" + type(exc).__name__] for c in remaining}

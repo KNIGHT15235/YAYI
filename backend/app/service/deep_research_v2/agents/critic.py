@@ -158,13 +158,14 @@ fact_check_results每项先写reason中的核对依据或复算结果，再给st
 }}
 ```"""
 
-    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = "qwen-plus"):
+    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = None):
         super().__init__(
             name="CriticMaster",
             role="毒舌评论家",
             llm_api_key=llm_api_key,
             llm_base_url=llm_base_url,
-            model=model
+            model=model,
+            config_key="critic"
         )
 
     async def process(self, state: ResearchState) -> ResearchState:
@@ -447,8 +448,6 @@ fact_check_results每项先写reason中的核对依据或复算结果，再给st
                            "即使完全缺少来源也不能给 0 或百分制分数，缺陷必须如实记录到 issues。"),
             user_prompt=prompt,
             json_mode=True,
-            temperature=0,
-            max_tokens=16000,
             use_cache=False  # HTTP成功不等于审核结果有效；不复用未校验的模型输出。
         )
         self.logger.info(f"[CriticMaster] LLM 响应长度: {len(response)}")

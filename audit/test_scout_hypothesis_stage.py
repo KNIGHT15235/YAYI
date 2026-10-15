@@ -108,8 +108,14 @@ class ScoutHypothesisStageTests(unittest.IsolatedAsyncioTestCase):
              patch(ROLE + ".json_call", new_callable=AsyncMock, side_effect=verify) as model:
             await scout_science(scout, state)
             await analyze_science(agent(), state)
-            await visualize_science(agent(), state)
         model.assert_awaited_once()
+        with patch(ROLE + ".json_call", new_callable=AsyncMock, return_value={"charts": [
+            {"id": cid, "type": "bar", "orientation": "vertical"}
+            for cid in ("corpus_years", "corpus_methods")
+        ]}) as chart_model:
+            await visualize_science(agent(), state)
+        chart_model.assert_awaited_once()
+        self.assertIn("统计数据与口径", chart_model.call_args.args[1])
         self.assertEqual(state["hypotheses"][0]["status"], "mixed")
         self.assertEqual(len(state["hypotheses"][0]["evidence_ids"]), 2)
         self.assertTrue(state["evidence_assessment"]["sufficient"])

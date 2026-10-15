@@ -44,7 +44,7 @@ class RevisionIntegrityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(original, prompt)
         self.assertIn("TAIL_CONCLUSION", prompt)
         self.assertIn("https://example.com/tail-source", prompt)
-        self.assertEqual(worker.call_llm.call_args.kwargs["max_tokens"], 16000)
+        self.assertEqual(worker.call_llm.call_args.kwargs["stage"], "revision")
 
     async def test_truncated_revision_cannot_replace_full_draft_or_resolve_issues(self):
         original = report()

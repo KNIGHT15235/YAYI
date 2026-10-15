@@ -171,6 +171,7 @@ class ResearchState(TypedDict):
 
     # 分析输出
     charts: List[Dict[str, Any]]            # 生成的图表
+    visualization_plan: Dict[str, Any]     # 模型选择的展示方案或明确记录的模板降级
     code_executions: List[Dict[str, Any]]   # 代码执行记录
     insights: List[str]                     # 数据洞察
 

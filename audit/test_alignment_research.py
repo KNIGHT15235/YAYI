@@ -165,7 +165,7 @@ class AgentAlignmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings.scout.model, "qwen-plus")
         with patch.dict(os.environ):
             os.environ.pop("CRITIC_MODEL", None)
-            self.assertEqual(AgentsConfig().critic.model, "qwen-plus")
+            self.assertEqual(AgentsConfig().critic.model, "deepseek-v3.2")
 
     async def test_original_reading_budget_is_shared_by_parallel_sections(self):
         scout = DeepScout.__new__(DeepScout)

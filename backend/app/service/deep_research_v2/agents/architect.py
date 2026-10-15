@@ -96,13 +96,14 @@ class ChiefArchitect(BaseAgent):
 }}
 ```"""
 
-    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = "qwen-max"):
+    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = None):
         super().__init__(
             name="ChiefArchitect",
             role="总架构师",
             llm_api_key=llm_api_key,
             llm_base_url=llm_base_url,
-            model=model
+            model=model,
+            config_key="architect"
         )
 
     def _convert_flat_to_outline(self, flat_result: Dict) -> Dict:
@@ -201,8 +202,6 @@ class ChiefArchitect(BaseAgent):
                 system_prompt="你是一位专业的行业研究规划师。请严格按照要求的JSON格式输出，不要添加任何额外内容。",
                 user_prompt=prompt,
                 json_mode=True,
-                temperature=0.3,
-                max_tokens=16000  # 拉满到最大值
             )
 
             # Debug: 记录原始响应

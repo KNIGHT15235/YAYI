@@ -2,7 +2,7 @@
 from copy import deepcopy
 from .llm_config import resolve_agent_model
 
-PROFILE_VERSION = "2026-10-14.1"
+PROFILE_VERSION = "2026-10-15.1"
 PROFILES = {
     "science": {
         "profile_id": "science", "mode": "science", "discipline": "跨学科科研",
@@ -17,7 +17,7 @@ PROFILES = {
         "stock_enrichment": False, "allowed_sources": ["literature", "web", "local"],
         "agent_models": {"architect": "deepseek-v3.2", "scout": "qwen-plus",
                          "data_analyst": "qwen-plus", "wizard": "deepseek-v3.2",
-                         "writer": "deepseek-v3.2", "critic": "qwen-plus"},
+                         "writer": "deepseek-v3.2", "critic": "deepseek-v3.2"},
         "method_terms": {
             "Transformer": ["transformer", "vision transformer"],
             "卷积网络": ["convolution", "cnn", "卷积"],

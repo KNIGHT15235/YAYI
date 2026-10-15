@@ -213,13 +213,14 @@ class LeadWriter(BaseAgent):
 }}
 ```"""
 
-    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = "qwen-max"):
+    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = None):
         super().__init__(
             name="LeadWriter",
             role="首席笔杆",
             llm_api_key=llm_api_key,
             llm_base_url=llm_base_url,
-            model=model
+            model=model,
+            config_key="writer"
         )
 
     async def process(self, state: ResearchState) -> ResearchState:
@@ -328,8 +329,6 @@ class LeadWriter(BaseAgent):
             system_prompt="你是顶级的行业研究分析师，擅长撰写专业的研究报告。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.4,
-            max_tokens=16000  # 拉满到最大值
         )
 
         result = self.parse_json_response(response)
@@ -400,8 +399,6 @@ class LeadWriter(BaseAgent):
             system_prompt="你是资深的研究报告主编，擅长整合和打磨最终报告。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.3,
-            max_tokens=16000  # 拉满到最大值
         )
 
         result = self.parse_json_response(response)
@@ -468,10 +465,9 @@ class LeadWriter(BaseAgent):
 
         response = await self.call_llm(
             system_prompt="你是负责修订报告的资深编辑。",
+            stage="revision",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.3,
-            max_tokens=16000  # 拉满到最大值
         )
 
         result = self.parse_json_response(response)

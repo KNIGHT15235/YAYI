@@ -242,13 +242,14 @@ class DataAnalyst(BaseAgent):
 }}
 ```"""
 
-    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = "qwen-plus"):
+    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = None):
         super().__init__(
             name="DataAnalyst",
             role="数据分析师",
             llm_api_key=llm_api_key,
             llm_base_url=llm_base_url,
-            model=model
+            model=model,
+            config_key="data_analyst"
         )
 
     async def process(self, state: ResearchState) -> ResearchState:
@@ -344,7 +345,6 @@ class DataAnalyst(BaseAgent):
             system_prompt="你是专业的数据分析师，擅长从文本中提取结构化数据。请输出JSON格式。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
         )
 
         result = self.parse_json_response(response)
@@ -384,7 +384,6 @@ class DataAnalyst(BaseAgent):
             system_prompt="你是知识图谱专家，擅长从文本中提取实体和关系。请输出JSON格式。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
         )
 
         result = self.parse_json_response(response)
@@ -432,7 +431,6 @@ class DataAnalyst(BaseAgent):
             system_prompt="你是数据可视化专家，擅长生成ECharts图表配置。请输出JSON格式。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.3
         )
 
         result = self.parse_json_response(response)
@@ -478,7 +476,6 @@ class DataAnalyst(BaseAgent):
             system_prompt="你是数据分析师，提取关键数据。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
         )
 
         return self.parse_json_response(response)

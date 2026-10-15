@@ -189,7 +189,9 @@ async def _propose(agent, state, node, evidence_ids, limits, timeout):
     try:
         response = await asyncio.wait_for(agent.call_llm(
             system_prompt="你是科研检索规划员，只提出有来源的检索线索，不写入证据或作出事实结论。",
-            user_prompt=prompt, json_mode=True, temperature=.2, max_tokens=1400, use_cache=True), timeout=timeout)
+            user_prompt=prompt, json_mode=True,
+            stage="supplementary" if state["science_retrieval"].get("active_batch", {}).get("origin") == "supplementary" else None,
+            use_cache=True), timeout=timeout)
         result = agent.parse_json_response(response)
     except (asyncio.CancelledError, GeneratorExit):
         raise

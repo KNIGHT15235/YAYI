@@ -469,9 +469,12 @@ class AsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
         state = fixture_state()
         add_papers(state, 4)
         corpus_analysis(state)
-        await visualize_science(agent(), state)
-        first = copy.deepcopy(state["charts"])
-        await visualize_science(agent(), state)
+        design = {"charts": [{"id": cid, "type": "bar", "orientation": "vertical"}
+                             for cid in ("corpus_years", "corpus_methods")]}
+        with patch("service.deep_research_v2.science_roles.json_call", new_callable=AsyncMock, return_value=design):
+            await visualize_science(agent(), state)
+            first = copy.deepcopy(state["charts"])
+            await visualize_science(agent(), state)
         self.assertEqual(first, state["charts"])
         self.assertEqual(sum(first[0]["echarts_option"]["series"][0]["data"]), 4)
 

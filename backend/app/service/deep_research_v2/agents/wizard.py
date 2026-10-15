@@ -342,13 +342,14 @@ df = df.dropna()
         r'\b__code__\b',              # __code__
     ]
 
-    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = "qwen-max"):
+    def __init__(self, llm_api_key: str, llm_base_url: str, model: str = None):
         super().__init__(
             name="CodeWizard",
             role="数据极客",
             llm_api_key=llm_api_key,
             llm_base_url=llm_base_url,
-            model=model
+            model=model,
+            config_key="wizard"
         )
 
     async def process(self, state: ResearchState) -> ResearchState:
@@ -630,7 +631,6 @@ df = df.dropna()
                 system_prompt="你是Python代码调试专家，擅长分析错误并修复代码。",
                 user_prompt=prompt,
                 json_mode=True,
-                temperature=0.2
             )
             return self.parse_json_response(response)
         except Exception as e:

@@ -61,6 +61,23 @@ node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5199 --strictPort
 
 模型优先级为角色 `*_MODEL` > `DEFAULT_MODEL` > 已保存的配置/默认值，具体模型需在所用供应商账户中可用。服务已运行时不要重复启动；端口冲突先确认占用进程。不要在研究运行中修改前端源码触发热更新，否则 SSE 断开会按中断处理。
 
+六角色的默认请求参数如下，统一维护在 `backend/app/config/llm_config.py`，同时应用到科研与行业流程。`max_tokens` 是每次调用的输出上限，不是输入上下文容量，也不保证模型一定生成完整 JSON。
+
+| 角色 | 默认模型 | temperature | max_tokens |
+|---|---|---|---|
+| ChiefArchitect | deepseek-v3.2 | 0.3 | 16000 |
+| DeepScout | qwen-plus | 初检 0.2；补检 0.1 | 8000 |
+| DataAnalyst | qwen-plus | 0.2 | 8000 |
+| CodeWizard | deepseek-v3.2 | 0.1 | 6000 |
+| LeadWriter | deepseek-v3.2 | 初稿 0.4；定向修订 0.1 | 16000 |
+| CriticMaster | deepseek-v3.2 | 0.2 | 16000 |
+
+上面的 WSL 历史验收命令显式设置了 `DEFAULT_MODEL=qwen-plus`，会覆盖此表的模型默认值。要采用此表，请移除该覆盖，并确认环境与 `.env` 中没有其他模型覆盖；恢复旧会话仍保留检查点中的模型选择，显式环境配置优先。模型服务必须支持所选模型及当前调用使用的 JSON 输出。
+
+科研 CodeWizard 调用模型为已计算的年份/方法关键词分布选择图表类型和布局；服务端校验方案并填入真实统计值、标签及证据来源。模型不生成或执行计算代码。设计服务失败或方案无效时使用统计柱状图模板，并在 `visualization_plan` 与进度事件中记录降级；没有可绘制统计时跳过模型调用。
+
+本次默认配置调整通过 Windows Python 3.12 下的 319 项相关离线回归（外部连接禁用，事件循环使用内部 loopback socketpair）。新增 `audit/test_agent_request_configuration.py` 直接核对模拟 SDK 收到的参数，覆盖六角色、补检/修订切换、图表方案校验、数据来源保护及取消/降级。这不代表已完成新配置的真实供应商联调。
+
 不同机器请替换上述路径和端口。不要重复启动与既有服务同名、同端口的容器，也不要为运行 Demo 清空数据库。真实模型、文档解析、embedding 和重排调用可能产生供应商费用。
 
 ## 体验科研链路

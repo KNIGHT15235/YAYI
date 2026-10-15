@@ -36,12 +36,17 @@ class AgentModelConfig:
     model: str
     temperature: float = 0.7
     max_tokens: int = 8000
+    stage_temperatures: Dict[str, float] = field(default_factory=dict)
+
+    def temperature_for(self, stage: Optional[str] = None) -> float:
+        return self.stage_temperatures.get(stage, self.temperature)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "model": self.model,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens
+            "max_tokens": self.max_tokens,
+            "stage_temperatures": dict(self.stage_temperatures),
         }
 
 
@@ -51,43 +56,45 @@ class AgentsConfig:
     # 规划师 - 分析问题，生成研究大纲
     architect: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
         model=resolve_agent_model("architect", "deepseek-v3.2"),
-        temperature=0.7,
-        max_tokens=4000
+        temperature=0.3,
+        max_tokens=16000
     ))
 
     # 侦察员 - 深度搜索（使用较快的模型）
     scout: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
         model=resolve_agent_model("scout", "qwen-plus"),  # 搜索阶段用快速模型
-        temperature=0.5,
-        max_tokens=4000
+        temperature=0.2,
+        max_tokens=8000,
+        stage_temperatures={"supplementary": 0.1}
     ))
 
     # 数据分析师 - 数据提取和分析
     data_analyst: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
         model=resolve_agent_model("data_analyst", "qwen-plus"),
-        temperature=0.3,
+        temperature=0.2,
         max_tokens=8000
     ))
 
     # 代码极客 - 代码生成和图表绘制
     wizard: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
         model=resolve_agent_model("wizard", "deepseek-v3.2"),
-        temperature=0.3,
-        max_tokens=8000
+        temperature=0.1,
+        max_tokens=6000
     ))
 
-    # 审核采用支持JSON输出的模型；独立配置，不影响其他研究Agent。
+    # 审核师 - 核验引用与声明，判断后续处理动作
     critic: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
-        model=resolve_agent_model("critic", "qwen-plus"),
-        temperature=0,
+        model=resolve_agent_model("critic", "deepseek-v3.2"),
+        temperature=0.2,
         max_tokens=16000
     ))
 
     # 首席写手 - 报告撰写
     writer: AgentModelConfig = field(default_factory=lambda: AgentModelConfig(
         model=resolve_agent_model("writer", "deepseek-v3.2"),
-        temperature=0.7,
-        max_tokens=16000
+        temperature=0.4,
+        max_tokens=16000,
+        stage_temperatures={"revision": 0.1}
     ))
 
 

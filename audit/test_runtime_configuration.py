@@ -17,7 +17,7 @@ from service.research_guard import ResearchLease
 ROLES = ("architect", "scout", "data_analyst", "wizard", "writer", "critic")
 EMPTY_MODEL_ENV = {"DEFAULT_MODEL": "", **{f"{role.upper()}_MODEL": "" for role in ROLES}}
 DEFAULTS = dict(zip(ROLES, ("deepseek-v3.2", "qwen-plus", "qwen-plus",
-                           "deepseek-v3.2", "deepseek-v3.2", "qwen-plus")))
+                           "deepseek-v3.2", "deepseek-v3.2", "deepseek-v3.2")))
 
 
 class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):

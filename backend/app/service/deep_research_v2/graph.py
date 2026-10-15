@@ -191,7 +191,9 @@ class DeepResearchGraph:
             model = resolve_agent_model(name, saved or config.get_agent_config(name).model)
             if saved and saved != model:
                 logger.info("Explicit model override applied to %s: %s -> %s", name, saved, model)
-            getattr(self, name).model = model
+            agent = getattr(self, name)
+            agent.model = model
+            agent.model_config = config.get_agent_config(name)
             # Persist the model actually used, including an explicit override on resume.
             models[name] = model
 

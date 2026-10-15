@@ -179,7 +179,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.cancelled = True
             # No further SSE pull happens before cancellation is observed.
             await asyncio.wait_for(agent_stopped.wait(), timeout=1.5)
-            await asyncio.sleep(0)
+            # Agent cleanup and durable pause are separate awaited operations.
+            # One event-loop tick is not a cross-platform completion barrier.
+            async def wait_for_snapshot():
+                while not graph.checkpoint_service.snapshots:
+                    await asyncio.sleep(.01)
+            await asyncio.wait_for(wait_for_snapshot(), timeout=1.5)
             self.assertEqual(graph.checkpoint_service.snapshots[-1]["status"], "paused")
             tail = [event async for event in events]
         self.assertEqual(calls, ["scout"])
